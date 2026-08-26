@@ -1,0 +1,24 @@
+services:
+  english-teacher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: english-teacher
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    # Sur un serveur Linux, ceci permet de joindre AnkiConnect sur 127.0.0.1:8765
+    # tout en le laissant lié au loopback de l'hôte.
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+

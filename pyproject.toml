@@ -1,0 +1,25 @@
+[project]
+name = "english-teacher-bot"
+version = "0.1.0"
+description = "Private Telegram English coach with local RAG memory and Anki export"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "aiosqlite>=0.21,<1",
+    "httpx>=0.28,<1",
+    "python-dotenv>=1.1,<2",
+    "python-telegram-bot[job-queue]>=22.2,<23",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4,<9",
+    "pytest-asyncio>=1.1,<2",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
