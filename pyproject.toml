@@ -6,8 +6,10 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "aiosqlite>=0.21,<1",
     "httpx>=0.28,<1",
+    "pandas>=2.2,<3",
     "python-dotenv>=1.1,<2",
     "python-telegram-bot[job-queue]>=22.2,<23",
+    "streamlit>=1.40,<2",
 ]
 
 [dependency-groups]
@@ -22,4 +24,3 @@ package = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-

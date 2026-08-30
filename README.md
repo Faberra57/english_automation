@@ -60,6 +60,9 @@ chmod 700 data
 - `DEEPSEEK_API_KEY`
 - `GROQ_API_KEY`
 
+Pour limiter les entrées pendant les tests, utilisez `INPUT_MODE=write_only`,
+`INPUT_MODE=audio_only` ou `INPUT_MODE=both` (valeur par défaut).
+
 Le chat privé avec le bot a généralement le même ID numérique que l'utilisateur. En cas de doute, démarrez temporairement le bot avec un ID fictif et envoyez `/start` : la réponse d'accès refusé affiche l'ID à autoriser.
 
 Validez puis démarrez :
@@ -79,6 +82,40 @@ uv run --locked python -m english_teacher --check
 uv run --locked python -m pytest
 ```
 
+## Tableau de bord Streamlit
+
+Le tableau de bord local est séparé en trois pages :
+
+- **Journal** : productions regroupées par jour, sujet associé, recherche et filtres,
+  textes originaux, lecteur audio, transcriptions, corrections annotées en rouge/vert,
+  reformulations C1–C2, erreurs et cartes Anki ;
+- **Cartes** : historique intégral des propositions, comparaison recto/verso et
+  sélection contrôlée de 5 à 10 cartes ; les cartes non choisies restent visibles ;
+- **Statistiques** : régularité, volumes writing/speaking, mots pratiqués, catégories
+  d'erreurs, cartes Anki, santé des traitements et erreurs récurrentes.
+
+Lancement local :
+
+```bash
+uv sync --locked
+uv run --locked streamlit run streamlit_app.py
+```
+
+Ouvrez ensuite <http://localhost:8501>. Le tableau de bord ouvre SQLite en lecture
+seule et actualise les données toutes les 15 secondes (un bouton d'actualisation est
+aussi disponible).
+
+Avec Docker, le service `dashboard` démarre avec le bot :
+
+```bash
+docker compose up -d --build
+docker compose logs -f dashboard
+```
+
+Par sécurité, le port est lié uniquement à `127.0.0.1:8501`. Depuis un serveur distant,
+utilisez un tunnel SSH (`ssh -L 8501:127.0.0.1:8501 utilisateur@serveur`) plutôt que
+d'exposer directement les productions et audios sur Internet.
+
 Le `network_mode: host` est adapté au serveur Linux demandé et permet au conteneur d'atteindre AnkiConnect sur `127.0.0.1:8765`. Si Anki Desktop est lui-même dans un autre conteneur, retirez `network_mode: host`, placez les deux services sur le même réseau Compose et mettez par exemple `ANKICONNECT_URL=http://anki-desktop:8765`.
 
 ### Préparer AnkiConnect
@@ -95,12 +132,22 @@ Pour désactiver temporairement l'intégration : `ANKI_ENABLED=false`. Les fiche
 
 - Envoyer un texte : archivage et correction immédiate.
 - Envoyer une note vocale, un audio ou un document audio : archivage du fichier original, transcription archivée, puis correction.
+- `/writing` : lance immédiatement un exercice écrit, sans attendre l'horaire planifié.
+- `/speaking` : lance immédiatement un exercice oral, sans attendre l'horaire planifié.
+- `/journaling` : ouvre une entrée libre sur votre journée, sans sujet généré ; le
+  prochain texte est archivé, analysé et corrigé comme un writing.
 - `/topic` : force la génération du sujet du jour.
-- `/cards` : crée les fiches du jour puis retente toute la file Anki.
+- `/cards` : au premier appel, génère 20 propositions (5 cartes de vocabulaire
+  thématique, 5 structures utiles, 5 cartes de grammaire et 5 cartes liées aux
+  erreurs de vocabulaire ou autres). Après la sélection Streamlit, un nouvel appel
+  envoie uniquement les cartes choisies vers Anki.
 - `/stats` : compteurs de la mémoire locale.
 - `/retry 42` : retente la transcription/correction de la production 42.
+- `/help` : affiche le résumé des commandes directement dans Telegram.
 
 Le bot ignore tous les comptes qui ne figurent pas dans `TELEGRAM_ALLOWED_USER_IDS`.
+Tous les messages pédagogiques du bot, les sujets, corrections, explications et cartes
+sont produits en anglais.
 
 ## Données et sauvegarde
 

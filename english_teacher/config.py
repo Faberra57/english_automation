@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 WEEKDAYS = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+INPUT_MODES = {"write_only", "audio_only", "both"}
 
 
 def env_bool(value: str | None, default: bool = False) -> bool:
@@ -73,6 +74,7 @@ class Settings:
     telegram_base_file_url: str
     telegram_max_audio_mb: int
     telegram_ack_message: str
+    input_mode: str
     timezone: ZoneInfo
     morning_enabled: bool
     morning_clock: tuple[int, int]
@@ -133,6 +135,11 @@ class Settings:
     @classmethod
     def from_env(cls, source: Mapping[str, str] | None = None) -> "Settings":
         env = source or os.environ
+        input_mode = env.get("INPUT_MODE", "both").strip().lower()
+        if input_mode not in INPUT_MODES:
+            raise ValueError(
+                f"INPUT_MODE invalide: {input_mode!r}; valeurs attendues: write_only, audio_only ou both"
+            )
         try:
             timezone = ZoneInfo(env.get("TZ", "Europe/Paris"))
         except ZoneInfoNotFoundError as exc:
@@ -150,7 +157,8 @@ class Settings:
             telegram_base_url=env.get("TELEGRAM_BASE_URL", "").strip().rstrip("/"),
             telegram_base_file_url=env.get("TELEGRAM_BASE_FILE_URL", "").strip().rstrip("/"),
             telegram_max_audio_mb=env_int(env, "TELEGRAM_MAX_AUDIO_MB", 19, 1),
-            telegram_ack_message=env.get("TELEGRAM_ACK_MESSAGE", "Bien reçu — je prépare ta correction…"),
+            telegram_ack_message=env.get("TELEGRAM_ACK_MESSAGE", "Got it — I’m preparing your correction…"),
+            input_mode=input_mode,
             timezone=timezone,
             morning_enabled=env_bool(env.get("MORNING_ENABLED"), True),
             morning_clock=parse_clock(env.get("MORNING_TIME", "07:30")),
@@ -178,13 +186,13 @@ class Settings:
             groq_max_retries=env_int(env, "GROQ_MAX_RETRIES", 3, 1),
             learner_name=env.get("LEARNER_NAME", "Learner"),
             learner_level=env.get("LEARNER_LEVEL", "B1"),
-            explanation_language=env.get("EXPLANATION_LANGUAGE", "français"),
-            target_language=env.get("TARGET_LANGUAGE", "anglais"),
+            explanation_language=env.get("EXPLANATION_LANGUAGE", "English"),
+            target_language=env.get("TARGET_LANGUAGE", "English"),
             learner_interests=env.get("LEARNER_INTERESTS", "vie quotidienne"),
             daily_activity_minutes=env_int(env, "DAILY_ACTIVITY_MINUTES", 5, 1),
-            max_errors=env_int(env, "MAX_ERRORS_PER_SUBMISSION", 5, 1),
+            max_errors=env_int(env, "MAX_ERRORS_PER_SUBMISSION", 25, 1),
             daily_card_limit=env_int(env, "DAILY_CARD_LIMIT", 5, 1),
-            correction_style=env.get("CORRECTION_STYLE", "encourageant, direct et concis"),
+            correction_style=env.get("CORRECTION_STYLE", "encouraging, direct, and concise"),
             rag_top_k=env_int(env, "RAG_TOP_K", 12, 1),
             rag_candidate_limit=env_int(env, "RAG_CANDIDATE_LIMIT", 300, 1),
             rag_history_days=env_int(env, "RAG_HISTORY_DAYS", 180, 1),
@@ -231,4 +239,3 @@ class Settings:
 
     def scheduled_time(self, clock: tuple[int, int]) -> time:
         return time(clock[0], clock[1], tzinfo=self.timezone)
-

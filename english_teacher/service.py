@@ -27,28 +27,30 @@ class EnglishTeacherService:
 
     async def correct(self, submission_id: int, production: str, kind: str) -> dict[str, Any]:
         rag = await self.db.rag_context(production)
-        system = f"""Tu es professeur de {self.settings.target_language} pour {self.settings.learner_name}, niveau {self.settings.learner_level}.
-Ton style est {self.settings.correction_style}. Analyse uniquement la production fournie. Les souvenirs RAG sont un historique: ne les compte pas comme des erreurs présentes aujourd'hui.
-Pour un audio, tu ne disposes que de la transcription: n'invente aucune évaluation de prononciation ou d'intonation.
-Retourne exclusivement un objet JSON valide ayant exactement cette structure:
+        system = f"""You are an English teacher for {self.settings.learner_name}, level {self.settings.learner_level}.
+Your style is {self.settings.correction_style}. Write all learner-facing content exclusively in English. Analyze only the submitted production. RAG memories are historical context: never count them as errors made today.
+For audio, you only have a transcript: never invent feedback about pronunciation or intonation.
+Return only one valid JSON object with exactly this structure:
 {{
-  "feedback": "bilan utile en français, texte brut",
-  "corrected_version": "version anglaise naturelle complète",
-  "strengths": ["point positif"],
+  "feedback": "helpful feedback in English, plain text",
+  "corrected_version": "complete natural English version",
+  "advanced_rewrite": "a polished C1-C2 reformulation that preserves the learner's meaning and voice",
+  "strengths": ["positive point in English"],
   "errors": [
-    {{"category":"catégorie stable et courte", "original":"segment exact", "corrected":"correction idiomatique", "explanation_fr":"explication en français", "practice_tip":"mini conseil", "severity":3, "confidence":0.95}}
+    {{"category":"short stable category in English", "original":"exact segment", "corrected":"idiomatic correction", "explanation_fr":"explanation in English", "practice_tip":"short tip in English", "severity":3, "confidence":0.95}}
   ]
 }}
-Maximum {self.settings.max_errors} erreurs, classées par impact pédagogique. N'invente pas d'erreur pour atteindre le maximum; retourne [] si tout est correct. JSON seulement."""
-        user = f"""TYPE DE PRODUCTION: {kind}
-PRODUCTION À CORRIGER:
+The corrected_version should fix the production naturally without unnecessarily changing its style. The advanced_rewrite should demonstrate sophisticated, idiomatic C1-C2 English while preserving the original facts, intent, and tone; never invent details.
+Identify every real error, including grammar, tense, agreement, articles, prepositions, capitalization, punctuation, spelling, collocation, register, and unnatural word choice. Every correction made in corrected_version must have a matching item in errors; reserve optional stylistic enhancement for advanced_rewrite instead of silently rewriting it. Return up to {self.settings.max_errors} errors, ordered by their position in the production. Never invent errors to reach the maximum; return [] when the production is correct. JSON only."""
+        user = f"""PRODUCTION TYPE: {kind}
+PRODUCTION TO CORRECT:
 ---
 {production}
 ---
-MÉMOIRE RAG DES FAIBLESSES PASSÉES:
+RAG MEMORY OF PREVIOUS WEAKNESSES:
 {rag}
 
-Analyse cette production et réponds en JSON."""
+Analyze this production and respond in JSON."""
         result = await self.deepseek.json_completion(system, user)
         raw_errors = result.get("errors", [])
         errors = [error for error in raw_errors if isinstance(error, dict)] if isinstance(raw_errors, list) else []
@@ -67,92 +69,144 @@ Analyse cette production et réponds en JSON."""
         return result
 
     def format_correction(self, result: Mapping[str, Any]) -> str:
-        lines = ["Correction", "", str(result.get("feedback", "Voici ton bilan."))]
+        lines = ["Correction", "", str(result.get("feedback", "Here is your feedback."))]
         strengths = result.get("strengths") or []
         if strengths:
-            lines.extend(["", "Points forts", *[f"• {item}" for item in strengths]])
+            lines.extend(["", "Strengths", *[f"• {item}" for item in strengths]])
         corrected = str(result.get("corrected_version", "")).strip()
         if corrected:
-            lines.extend(["", "Version naturelle", corrected])
+            lines.extend(["", "Natural version", corrected])
+        advanced = str(result.get("advanced_rewrite", "")).strip()
+        if advanced:
+            lines.extend(["", "C1–C2 reformulation", advanced])
         errors = result.get("errors") or []
         if errors:
-            lines.extend(["", f"Erreurs prioritaires ({len(errors)})"])
+            lines.extend(["", f"Priority errors ({len(errors)})"])
             for index, error in enumerate(errors, 1):
                 lines.extend(
                     [
-                        f"{index}. {error.get('category', 'Erreur')}",
+                        f"{index}. {error.get('category', 'Error')}",
                         f"   {error.get('original', '')} → {error.get('corrected', '')}",
                         f"   {error.get('explanation_fr', '')}",
                     ]
                 )
         else:
-            lines.extend(["", "Aucune erreur notable détectée. Bravo !"])
+            lines.extend(["", "No significant errors detected. Well done!"])
         return "\n".join(lines)
 
-    async def make_topic(self) -> tuple[dict[str, Any], str]:
+    async def make_topic(self, activity_mode: str | None = None) -> tuple[dict[str, Any], str, int]:
+        if activity_mode not in {None, "writing", "speaking"}:
+            raise ValueError(f"Mode d'activité inconnu: {activity_mode}")
         rag = await self.db.rag_context()
-        system = f"""Tu conçois un exercice quotidien d'anglais pour un francophone de niveau {self.settings.learner_level}.
-Retourne exclusivement ce JSON:
-{{"title":"titre court", "mode":"oral ou écrit", "prompt":"consigne concrète en français avec la situation à produire en anglais", "focus_points":["cible 1","cible 2"], "starter":"première phrase anglaise facultative"}}
-L'exercice doit durer {self.settings.daily_activity_minutes} minutes, être motivant, exploiter 2 ou 3 faiblesses de la mémoire et varier le contexte. JSON seulement."""
-        user = f"""Centres d'intérêt: {self.settings.learner_interests}
-Faiblesses récupérées depuis la mémoire RAG:
+        mode_instruction = {
+            None: "Choose the most useful mode between writing and speaking.",
+            "writing": "Create a writing exercise only.",
+            "speaking": "Create a speaking exercise only.",
+        }[activity_mode]
+        system = f"""You design a daily English exercise for a learner at level {self.settings.learner_level}.
+All learner-facing content must be exclusively in English. Return only this JSON:
+{{"title":"short title in English", "mode":"writing or speaking", "prompt":"clear and concrete instructions in English", "focus_points":["focus 1","focus 2"], "starter":"optional opening sentence in English"}}
+{mode_instruction}
+The exercise should take {self.settings.daily_activity_minutes} minutes, feel motivating, use two or three weaknesses from memory, and vary the context. JSON only."""
+        user = f"""Learner interests: {self.settings.learner_interests}
+Weaknesses retrieved from RAG memory:
 {rag}
-Génère le sujet du jour en JSON."""
+Generate today's exercise as JSON."""
         topic = await self.deepseek.json_completion(system, user, max_tokens=1000)
-        await self.db.save_topic(self.settings.local_date(), topic, rag)
-        return topic, rag
+        topic_id = await self.db.save_topic(self.settings.local_date(), topic, rag)
+        return topic, rag, topic_id
 
     def format_topic(self, topic: Mapping[str, Any]) -> str:
         focus = topic.get("focus_points") or []
-        lines = [f"Sujet du jour — {topic.get('title', 'English practice')}", "", str(topic.get("prompt", ""))]
+        mode = str(topic.get("mode", "")).strip()
+        heading = (
+            f"{mode.title()} exercise — {topic.get('title', 'English practice')}"
+            if mode
+            else f"Today's exercise — {topic.get('title', 'English practice')}"
+        )
+        lines = [heading, "", str(topic.get("prompt", ""))]
         if focus:
-            lines.extend(["", "À travailler", *[f"• {item}" for item in focus]])
+            lines.extend(["", "Focus points", *[f"• {item}" for item in focus]])
         starter = str(topic.get("starter", "")).strip()
         if starter:
-            lines.extend(["", f"Pour démarrer : {starter}"])
-        lines.extend(["", "Réponds ici par texte ou note vocale."])
+            lines.extend(["", f"Starter: {starter}"])
+        topic_mode = str(topic.get("mode", "")).strip().lower()
+        instruction = (
+            "Reply with a voice note or audio file."
+            if topic_mode == "speaking"
+            else "Reply with a written message."
+            if topic_mode == "writing"
+            else "Reply with a written message or a voice note."
+        )
+        lines.extend(["", instruction])
         return "\n".join(lines)
 
     async def generate_cards(self, local_date: str) -> int:
-        errors = await self.db.uncarded_errors(local_date, self.settings.daily_card_limit)
-        if not errors:
+        if await self.db.proposal_count(local_date):
             return 0
-        compact_errors = [
-            {
-                "error_id": error["id"],
-                "category": error["category"],
-                "original": error["original_text"],
-                "corrected": error["corrected_text"],
-                "explanation_fr": error["explanation_fr"],
-            }
-            for error in errors
-        ]
-        system = """Tu crées des fiches Anki atomiques pour un francophone apprenant l'anglais.
-Retourne exclusivement un objet JSON de forme:
-{"cards":[{"error_id":123,"front":"concept ou consigne très courte en français","back":"phrase anglaise idiomatique complète suivie d'une brève explication française","tags":["grammar"]}]}
-Conserve chaque error_id fourni exactement une fois. La face avant ne doit pas révéler la réponse anglaise. La face arrière doit réemployer la correction dans une phrase mémorisable. JSON seulement."""
+        context = await self.db.card_generation_context(local_date)
+        if not context["submissions"]:
+            return 0
+        compact_submissions: list[dict[str, Any]] = []
+        for submission in context["submissions"]:
+            correction = {}
+            try:
+                correction = json.loads(submission.get("correction_json") or "{}")
+            except json.JSONDecodeError:
+                pass
+            compact_submissions.append(
+                {
+                    "activity_type": submission.get("activity_type") or submission.get("kind"),
+                    "production": submission.get("transcript") or submission.get("raw_text") or "",
+                    "corrected_version": correction.get("corrected_version", ""),
+                    "advanced_rewrite": correction.get("advanced_rewrite", ""),
+                }
+            )
+        learning_context = {
+            "topics": context["topics"],
+            "productions": compact_submissions,
+            "observed_errors": context["errors"],
+        }
+        system = """Create exactly 20 high-quality Anki card proposals for an English learner. All content must be in English.
+Return only one JSON object with exactly these four arrays and exactly five cards per array:
+{
+  "theme_vocabulary": [{"front":"recall prompt or contextual gap","back":"advanced word or phrase, definition, and natural example","rationale":"why it fits today's topic","tags":["vocabulary"]}],
+  "useful_structure": [{"front":"short completion or transformation prompt","back":"useful formulation or sentence structure with meaning and example","rationale":"when to use it","tags":["structure"]}],
+  "grammar_error": [{"front":"prompt based on an observed or closely related grammar weakness","back":"correct form, rule, and example","rationale":"error or weakness addressed","tags":["grammar"]}],
+  "vocabulary_error": [{"front":"prompt based on an observed vocabulary, collocation, register, or word-choice weakness","back":"idiomatic correction and example","rationale":"error or weakness addressed","tags":["vocabulary-error"]}]
+}
+The theme vocabulary should include sophisticated words the learner could naturally have used for today's topic. Useful structures should include reusable formulations such as “as far as … is concerned,” only when contextually appropriate. Grammar and vocabulary-error cards should prioritize actual errors; if fewer than five exist, create adjacent practice cards that target the same demonstrated weaknesses. Cards must be atomic, non-duplicative, practical, and suitable for active recall. The front must not reveal the answer. JSON only."""
         result = await self.deepseek.json_completion(
             system,
-            "Transforme ces erreurs en fiches:\n" + json.dumps(compact_errors, ensure_ascii=False),
-            max_tokens=1800,
+            "Create today's 20 proposals from this learning context:\n"
+            + json.dumps(learning_context, ensure_ascii=False)[:50000],
+            max_tokens=6000,
         )
-        valid_ids = {int(error["id"]) for error in errors}
-        cards: list[dict[str, Any]] = []
-        for raw_card in result.get("cards") or []:
-            if not isinstance(raw_card, dict):
-                continue
-            try:
-                error_id = int(raw_card.get("error_id"))
-            except (TypeError, ValueError):
-                continue
-            if error_id not in valid_ids or not str(raw_card.get("front", "")).strip() or not str(raw_card.get("back", "")).strip():
-                continue
-            cards.append({**raw_card, "error_id": error_id})
-        return await self.db.create_cards(cards)
+        categories = ("theme_vocabulary", "useful_structure", "grammar_error", "vocabulary_error")
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for category in categories:
+            raw_cards = result.get(category)
+            if not isinstance(raw_cards, list) or len(raw_cards) != 5:
+                raise ValueError(f"DeepSeek must return exactly 5 cards for {category}")
+            cards: list[dict[str, Any]] = []
+            for raw_card in raw_cards:
+                if not isinstance(raw_card, dict):
+                    raise ValueError(f"Invalid card in {category}")
+                front = str(raw_card.get("front") or "").strip()
+                back = str(raw_card.get("back") or "").strip()
+                if not front or not back:
+                    raise ValueError(f"Empty card in {category}")
+                tags = raw_card.get("tags") if isinstance(raw_card.get("tags"), list) else []
+                cards.append({**raw_card, "front": front, "back": back, "tags": [category, *tags]})
+            groups[category] = cards
+        return await self.db.create_card_proposals(local_date, groups)
 
     async def push_pending_cards(self) -> tuple[int, int]:
-        pending = await self.db.pending_cards()
+        legacy = [{**card, "_source_table": "cards"} for card in await self.db.pending_cards()]
+        proposals = [
+            {**card, "_source_table": "card_proposals"} for card in await self.db.pending_card_proposals()
+        ]
+        pending = [*legacy, *proposals]
         if not pending or not self.settings.anki_enabled:
             return 0, len(pending)
         pushed = 0
@@ -164,15 +218,20 @@ Conserve chaque error_id fourni exactement une fois. La face avant ne doit pas r
         for card in pending:
             try:
                 note_id = await self.anki.push_card(card)
-                await self.db.update_card(card["id"], status="pushed", note_id=note_id)
+                if card["_source_table"] == "card_proposals":
+                    await self.db.update_card_proposal(card["id"], status="pushed", note_id=note_id)
+                else:
+                    await self.db.update_card(card["id"], status="pushed", note_id=note_id)
                 pushed += 1
             except Exception as exc:
                 LOG.exception("Échec carte Anki %s", card["id"])
-                await self.db.update_card(card["id"], status="failed", error=str(exc)[:1000])
+                if card["_source_table"] == "card_proposals":
+                    await self.db.update_card_proposal(card["id"], status="failed", error=str(exc)[:1000])
+                else:
+                    await self.db.update_card(card["id"], status="failed", error=str(exc)[:1000])
         if pushed and self.settings.anki_sync_after_push:
             try:
                 await self.anki.invoke("sync")
             except Exception as exc:
                 LOG.warning("Cartes créées mais synchronisation Anki échouée: %s", exc)
         return pushed, len(pending) - pushed
-

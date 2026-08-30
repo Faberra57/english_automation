@@ -14,6 +14,15 @@ from .utils import bounded_number, iso_now, tokenize, utc_now
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS activity_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_date TEXT NOT NULL,
+    topic_json TEXT NOT NULL,
+    rag_context TEXT,
+    sent_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_topics_date ON activity_topics(local_date, sent_at);
+
 CREATE TABLE IF NOT EXISTS submissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -36,6 +45,8 @@ CREATE TABLE IF NOT EXISTS submissions (
     created_at TEXT NOT NULL,
     local_date TEXT NOT NULL,
     processed_at TEXT,
+    topic_id INTEGER REFERENCES activity_topics(id),
+    activity_type TEXT CHECK(activity_type IN ('writing','speaking','journaling')),
     UNIQUE(chat_id, telegram_message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_submissions_date ON submissions(local_date, created_at);
@@ -81,6 +92,30 @@ CREATE TABLE IF NOT EXISTS cards (
 );
 CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status, created_at);
 
+CREATE TABLE IF NOT EXISTS card_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_date TEXT NOT NULL,
+    category TEXT NOT NULL CHECK(category IN (
+        'theme_vocabulary','useful_structure','grammar_error','vocabulary_error'
+    )),
+    position INTEGER NOT NULL CHECK(position BETWEEN 1 AND 5),
+    front TEXT NOT NULL,
+    back TEXT NOT NULL,
+    rationale TEXT,
+    tags_json TEXT NOT NULL,
+    selected INTEGER NOT NULL DEFAULT 0 CHECK(selected IN (0,1)),
+    status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','pending','pushed','failed')),
+    anki_note_id INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    selected_at TEXT,
+    pushed_at TEXT,
+    UNIQUE(local_date, category, position)
+);
+CREATE INDEX IF NOT EXISTS idx_card_proposals_date ON card_proposals(local_date, category, position);
+CREATE INDEX IF NOT EXISTS idx_card_proposals_queue ON card_proposals(selected, status, created_at);
+
 CREATE TABLE IF NOT EXISTS job_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_name TEXT NOT NULL,
@@ -111,6 +146,11 @@ class Database:
         db = await self.connect()
         try:
             await db.executescript(SCHEMA)
+            columns = {row[1] for row in await (await db.execute("PRAGMA table_info(submissions)")).fetchall()}
+            if "topic_id" not in columns:
+                await db.execute("ALTER TABLE submissions ADD COLUMN topic_id INTEGER REFERENCES activity_topics(id)")
+            if "activity_type" not in columns:
+                await db.execute("ALTER TABLE submissions ADD COLUMN activity_type TEXT")
             await db.commit()
         finally:
             await db.close()
@@ -120,6 +160,7 @@ class Database:
             "chat_id", "telegram_user_id", "telegram_message_id", "kind", "raw_text",
             "audio_path", "audio_original_name", "audio_mime_type", "audio_sha256",
             "telegram_file_id", "telegram_file_unique_id", "created_at", "local_date",
+            "topic_id", "activity_type",
         ]
         data = [values.get(column) for column in columns]
         db = await self.connect()
@@ -237,15 +278,22 @@ class Database:
         result = "\n".join(lines) or "Aucune erreur antérieure: commencer par un diagnostic général."
         return result[: self.settings.rag_max_context_chars]
 
-    async def save_topic(self, local_date: str, topic: Mapping[str, Any], rag_context: str) -> None:
+    async def save_topic(self, local_date: str, topic: Mapping[str, Any], rag_context: str) -> int:
         db = await self.connect()
         try:
+            topic_json = json.dumps(topic, ensure_ascii=False)
+            sent_at = iso_now()
+            cursor = await db.execute(
+                "INSERT INTO activity_topics(local_date,topic_json,rag_context,sent_at) VALUES(?,?,?,?)",
+                (local_date, topic_json, rag_context, sent_at),
+            )
             await db.execute(
                 "INSERT INTO topics(local_date,topic_json,rag_context,sent_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(local_date) DO UPDATE SET topic_json=excluded.topic_json,rag_context=excluded.rag_context,sent_at=excluded.sent_at",
-                (local_date, json.dumps(topic, ensure_ascii=False), rag_context, iso_now()),
+                (local_date, topic_json, rag_context, sent_at),
             )
             await db.commit()
+            return int(cursor.lastrowid)
         finally:
             await db.close()
 
@@ -286,6 +334,100 @@ class Database:
         finally:
             await db.close()
 
+    async def card_generation_context(self, local_date: str) -> dict[str, Any]:
+        db = await self.connect()
+        try:
+            topics = await (await db.execute(
+                "SELECT topic_json FROM activity_topics WHERE local_date=? ORDER BY sent_at",
+                (local_date,),
+            )).fetchall()
+            submissions = await (await db.execute(
+                """SELECT id,kind,activity_type,raw_text,transcript,correction_json
+                   FROM submissions WHERE local_date=? AND status='processed' ORDER BY created_at""",
+                (local_date,),
+            )).fetchall()
+            errors = await (await db.execute(
+                """SELECT e.category,e.original_text,e.corrected_text,e.explanation_fr,e.practice_tip,e.severity
+                   FROM errors e JOIN submissions s ON s.id=e.submission_id
+                   WHERE s.local_date=? ORDER BY e.severity DESC,e.rank""",
+                (local_date,),
+            )).fetchall()
+            return {
+                "topics": [json.loads(row["topic_json"]) for row in topics],
+                "submissions": [dict(row) for row in submissions],
+                "errors": [dict(row) for row in errors],
+            }
+        finally:
+            await db.close()
+
+    async def proposal_count(self, local_date: str) -> int:
+        db = await self.connect()
+        try:
+            row = await (await db.execute(
+                "SELECT COUNT(*) FROM card_proposals WHERE local_date=?", (local_date,)
+            )).fetchone()
+            return int(row[0])
+        finally:
+            await db.close()
+
+    async def create_card_proposals(self, local_date: str, groups: Mapping[str, Sequence[Mapping[str, Any]]]) -> int:
+        created = 0
+        db = await self.connect()
+        try:
+            for category, cards in groups.items():
+                for position, card in enumerate(cards, 1):
+                    raw_tags = card.get("tags") or []
+                    if not isinstance(raw_tags, (list, tuple)):
+                        raw_tags = []
+                    cursor = await db.execute(
+                        """INSERT OR IGNORE INTO card_proposals
+                           (local_date,category,position,front,back,rationale,tags_json,created_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (
+                            local_date,
+                            category,
+                            position,
+                            str(card.get("front") or "").strip(),
+                            str(card.get("back") or "").strip(),
+                            str(card.get("rationale") or "").strip(),
+                            json.dumps([str(tag) for tag in raw_tags if str(tag).strip()], ensure_ascii=False),
+                            iso_now(),
+                        ),
+                    )
+                    created += max(0, cursor.rowcount)
+            await db.commit()
+            return created
+        finally:
+            await db.close()
+
+    async def pending_card_proposals(self, limit: int = 100) -> list[dict[str, Any]]:
+        db = await self.connect()
+        try:
+            rows = await (await db.execute(
+                """SELECT * FROM card_proposals
+                   WHERE selected=1 AND status IN ('pending','failed')
+                   ORDER BY selected_at,created_at,id LIMIT ?""",
+                (limit,),
+            )).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            await db.close()
+
+    async def update_card_proposal(
+        self, proposal_id: int, *, status: str, note_id: int | None = None, error: str | None = None
+    ) -> None:
+        db = await self.connect()
+        try:
+            await db.execute(
+                """UPDATE card_proposals SET status=?,anki_note_id=COALESCE(?,anki_note_id),
+                   attempts=attempts+1,last_error=?,
+                   pushed_at=CASE WHEN ?='pushed' THEN ? ELSE pushed_at END WHERE id=?""",
+                (status, note_id, error, status, iso_now(), proposal_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
     async def pending_cards(self, limit: int = 100) -> list[dict[str, Any]]:
         db = await self.connect()
         try:
@@ -316,11 +458,12 @@ class Database:
                 "submissions": "SELECT COUNT(*) FROM submissions",
                 "audio": "SELECT COUNT(*) FROM submissions WHERE audio_path IS NOT NULL",
                 "errors": "SELECT COUNT(*) FROM errors",
-                "cards_pending": "SELECT COUNT(*) FROM cards WHERE status!='pushed'",
-                "cards_pushed": "SELECT COUNT(*) FROM cards WHERE status='pushed'",
+                "cards_pending": "SELECT (SELECT COUNT(*) FROM cards WHERE status!='pushed') + "
+                                 "(SELECT COUNT(*) FROM card_proposals WHERE selected=1 AND status!='pushed')",
+                "cards_pushed": "SELECT (SELECT COUNT(*) FROM cards WHERE status='pushed') + "
+                                "(SELECT COUNT(*) FROM card_proposals WHERE status='pushed')",
             }.items():
                 result[key] = int((await (await db.execute(query)).fetchone())[0])
             return result
         finally:
             await db.close()
-

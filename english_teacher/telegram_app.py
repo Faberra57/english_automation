@@ -5,6 +5,7 @@ import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction
@@ -27,13 +28,29 @@ from .utils import chunks, iso_now, safe_extension, sha256_file
 LOG = logging.getLogger("english_teacher.telegram")
 
 
+def input_mode_description(mode: str) -> str:
+    return {
+        "write_only": "writing only",
+        "audio_only": "audio only",
+        "both": "writing and audio",
+    }[mode]
+
+
+def input_instructions(mode: str) -> str:
+    return {
+        "write_only": "Send a written message in English.",
+        "audio_only": "Send a voice note or audio file in English.",
+        "both": "Send a written message, voice note, or audio file in English.",
+    }[mode]
+
+
 async def is_authorized(update: Update, settings: Settings) -> bool:
     user = update.effective_user
     if user and user.id in settings.allowed_user_ids:
         return True
     if update.effective_message and user:
         await update.effective_message.reply_text(
-            f"Accès refusé. Ton ID Telegram est {user.id}; ajoute-le explicitement à TELEGRAM_ALLOWED_USER_IDS."
+            f"Access denied. Your Telegram ID is {user.id}; add it explicitly to TELEGRAM_ALLOWED_USER_IDS."
         )
     LOG.warning("Tentative Telegram non autorisée user_id=%s", user.id if user else None)
     return False
@@ -41,6 +58,10 @@ async def is_authorized(update: Update, settings: Settings) -> bool:
 
 def get_service(context: ContextTypes.DEFAULT_TYPE | CallbackContext) -> EnglishTeacherService:
     return context.application.bot_data["service"]
+
+
+def pending_activities(context: ContextTypes.DEFAULT_TYPE | CallbackContext) -> dict[int, dict[str, Any]]:
+    return context.application.bot_data.setdefault("pending_activities", {})
 
 
 async def send_text(context: ContextTypes.DEFAULT_TYPE | CallbackContext, chat_id: int, text: str) -> None:
@@ -53,10 +74,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await is_authorized(update, settings):
         return
     await update.effective_message.reply_text(
-        "Ton professeur d'anglais est prêt.\n\n"
-        "Envoie un texte, une note vocale ou un fichier audio. Je conserve la production originale, "
-        "la transcription, la correction et tes erreurs dans la base locale.\n\n"
-        "Commandes : /topic, /cards, /stats, /retry <id>, /help"
+        "Your English teacher is ready.\n\n"
+        f"Active input mode: {input_mode_description(settings.input_mode)}.\n"
+        f"{input_instructions(settings.input_mode)} I keep the original production, transcript, "
+        "correction, and learning points in the local database.\n\n"
+        "Commands: /writing, /speaking, /journaling, /topic, /stats, /retry <id>, /cards, /help"
     )
 
 
@@ -65,26 +87,68 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await is_authorized(update, settings):
         return
     await update.effective_message.reply_text(
-        "/topic — générer immédiatement un sujet ciblé\n"
-        "/cards — créer et envoyer les fiches du jour vers Anki\n"
-        "/stats — voir les compteurs locaux\n"
-        "/retry <id> — retraiter une production en échec\n\n"
-        "Les tâches automatiques suivent les horaires et le fuseau définis dans .env."
+        "Available commands\n\n"
+        "/writing — start a writing exercise now\n"
+        "/speaking — start a speaking exercise now\n"
+        "/journaling — write freely about your day, without a topic\n"
+        "/topic — let the teacher choose writing or speaking\n"
+        "/stats — show your local learning counters\n"
+        "/retry <id> — retry a failed production\n"
+        "/cards — generate 20 proposals, or send your selected cards to Anki\n"
+        "/help — show this command summary\n\n"
+        f"Active input mode: {input_mode_description(settings.input_mode)}.\n"
+        "Automatic tasks follow the schedule and timezone configured in .env."
     )
 
 
 async def topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await exercise_command(update, context, None)
+
+
+async def writing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await exercise_command(update, context, "writing")
+
+
+async def speaking_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await exercise_command(update, context, "speaking")
+
+
+async def journaling_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not await is_authorized(update, settings):
+        return
+    chat_id = update.effective_chat.id
+    pending_activities(context)[chat_id] = {"topic_id": None, "activity_type": "journaling"}
+    await update.effective_message.reply_text(
+        "Journaling mode is ready. Write freely in English about your day, your thoughts, or how you feel. "
+        "There is no assigned topic. I will save, analyze, and correct your next written message like a normal writing."
+    )
+
+
+async def exercise_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    activity_mode: str | None,
+) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if not await is_authorized(update, settings):
         return
     message = update.effective_message
-    await message.reply_text("Je prépare un sujet à partir de tes faiblesses…")
+    label = {None: "an exercise", "writing": "a writing exercise", "speaking": "a speaking exercise"}[activity_mode]
+    await message.reply_text(f"I am preparing {label} based on your learning history…")
     try:
-        topic, _ = await get_service(context).make_topic()
+        topic, _, topic_id = await get_service(context).make_topic(activity_mode)
         await send_text(context, update.effective_chat.id, get_service(context).format_topic(topic))
+        selected_mode = activity_mode or str(topic.get("mode") or "writing").strip().lower()
+        if selected_mode not in {"writing", "speaking"}:
+            selected_mode = "writing"
+        pending_activities(context)[update.effective_chat.id] = {
+            "topic_id": topic_id,
+            "activity_type": selected_mode,
+        }
     except Exception:
-        LOG.exception("Génération manuelle du sujet échouée")
-        await message.reply_text("Impossible de générer le sujet pour le moment. Consulte les logs du conteneur.")
+        LOG.exception("Génération manuelle de l'exercice échouée")
+        await message.reply_text("I could not generate the exercise right now. Please check the application logs.")
 
 
 async def cards_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,13 +158,20 @@ async def cards_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     service = get_service(context)
     try:
         created = await service.generate_cards(settings.local_date())
+        if created:
+            await update.effective_message.reply_text(
+                f"I created {created} card proposals: 5 theme vocabulary cards, 5 useful structures, "
+                "5 grammar cards, and 5 vocabulary/error cards. Open the Cards page in Streamlit "
+                "and select between 5 and 10 cards. Unselected proposals will remain available."
+            )
+            return
         pushed, remaining = await service.push_pending_cards()
         await update.effective_message.reply_text(
-            f"Fiches créées : {created}\nEnvoyées vers Anki : {pushed}\nEn attente : {remaining}"
+            f"No new proposals were needed. Selected cards sent to Anki: {pushed}\nPending: {remaining}"
         )
     except Exception:
         LOG.exception("Création manuelle des cartes échouée")
-        await update.effective_message.reply_text("La création des fiches a échoué; les données sources sont conservées.")
+        await update.effective_message.reply_text("Card creation failed, but the source data is safely stored.")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -109,12 +180,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     stats = await get_service(context).db.stats()
     await update.effective_message.reply_text(
-        "Mémoire locale\n"
-        f"• Productions : {stats['submissions']}\n"
-        f"• Audios archivés : {stats['audio']}\n"
-        f"• Erreurs mémorisées : {stats['errors']}\n"
-        f"• Fiches synchronisées : {stats['cards_pushed']}\n"
-        f"• Fiches en attente : {stats['cards_pending']}"
+        "Local learning memory\n"
+        f"• Productions: {stats['submissions']}\n"
+        f"• Archived audio files: {stats['audio']}\n"
+        f"• Learning errors: {stats['errors']}\n"
+        f"• Synced cards: {stats['cards_pushed']}\n"
+        f"• Pending cards: {stats['cards_pending']}"
     )
 
 
@@ -123,13 +194,13 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await is_authorized(update, settings):
         return
     if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("Usage : /retry <id de production>")
+        await update.effective_message.reply_text("Usage: /retry <production ID>")
         return
     service = get_service(context)
     submission_id = int(context.args[0])
     submission = await service.db.get_submission(submission_id)
     if not submission or submission["telegram_user_id"] not in settings.allowed_user_ids:
-        await update.effective_message.reply_text("Production introuvable.")
+        await update.effective_message.reply_text("Production not found.")
         return
     try:
         production = submission["transcript"] or submission["raw_text"]
@@ -143,13 +214,16 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 submission_id, transcript=production, transcription_json=json.dumps(transcription, ensure_ascii=False)
             )
         if not production:
-            raise ValueError("aucun contenu à retraiter")
-        result = await service.correct(submission_id, production, submission["kind"])
+            raise ValueError("no content to retry")
+        production_type = submission.get("activity_type") or (
+            "written text" if submission["kind"] == "text" else "transcribed audio"
+        )
+        result = await service.correct(submission_id, production, production_type)
         await send_text(context, update.effective_chat.id, service.format_correction(result))
     except Exception as exc:
         LOG.exception("Retraitement %s échoué", submission_id)
         await service.db.update_submission(submission_id, status="failed", failure_reason=str(exc)[:1000])
-        await update.effective_message.reply_text(f"Retraitement impossible; ID conservé : {submission_id}")
+        await update.effective_message.reply_text(f"Retry failed. Your production is still stored as ID {submission_id}.")
 
 
 async def process_saved_submission(
@@ -168,8 +242,8 @@ async def process_saved_submission(
         LOG.exception("Traitement de la production %s échoué", submission_id)
         await service.db.update_submission(submission_id, status="failed", failure_reason=str(exc)[:1000])
         await update.effective_message.reply_text(
-            f"Le traitement a échoué, mais ta production est bien sauvegardée (ID {submission_id}). "
-            f"Tu pourras lancer /retry {submission_id}."
+            f"Processing failed, but your production is safely stored as ID {submission_id}. "
+            f"You can try again with /retry {submission_id}."
         )
 
 
@@ -178,23 +252,36 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await is_authorized(update, settings):
         return
     message = update.effective_message
+    if settings.input_mode == "audio_only":
+        await message.reply_text("The audio_only mode is active. Send a voice note or audio file.")
+        return
     text = (message.text or "").strip()
     if not text:
         return
     service = get_service(context)
+    chat_id = update.effective_chat.id
+    activity = pending_activities(context).get(chat_id)
+    if activity and activity["activity_type"] == "speaking":
+        await message.reply_text("This is a speaking exercise. Please reply with a voice note or audio file.")
+        return
+    activity_type = activity["activity_type"] if activity else "writing"
     submission_id = await service.db.add_submission(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         telegram_user_id=update.effective_user.id,
         telegram_message_id=message.message_id,
         kind="text",
         raw_text=text,
         created_at=iso_now(),
         local_date=settings.local_date(),
+        topic_id=activity.get("topic_id") if activity else None,
+        activity_type=activity_type,
     )
     if submission_id is None:
         return
+    pending_activities(context).pop(chat_id, None)
     await message.reply_text(settings.telegram_ack_message)
-    await process_saved_submission(update, context, submission_id, text, "texte écrit")
+    production_type = "journal entry" if activity_type == "journaling" else "written text"
+    await process_saved_submission(update, context, submission_id, text, production_type)
 
 
 async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -202,6 +289,9 @@ async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await is_authorized(update, settings):
         return
     message = update.effective_message
+    if settings.input_mode == "write_only":
+        await message.reply_text("The write_only mode is active. Send a written message in English.")
+        return
     service = get_service(context)
     if await service.db.submission_exists(update.effective_chat.id, message.message_id):
         return
@@ -215,9 +305,16 @@ async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         return
 
+    chat_id = update.effective_chat.id
+    activity = pending_activities(context).get(chat_id)
+    if activity and activity["activity_type"] in {"writing", "journaling"}:
+        expected = "journaling entry" if activity["activity_type"] == "journaling" else "writing exercise"
+        await message.reply_text(f"This is a {expected}. Please reply with a written message.")
+        return
+
     max_bytes = settings.telegram_max_audio_mb * 1024 * 1024
     if media.file_size and media.file_size > max_bytes:
-        await message.reply_text(f"Audio trop volumineux : limite configurée à {settings.telegram_max_audio_mb} Mo.")
+        await message.reply_text(f"This audio is too large. The configured limit is {settings.telegram_max_audio_mb} MB.")
         return
     local_now = datetime.now(settings.timezone)
     directory = settings.audio_dir / f"{local_now:%Y}" / f"{local_now:%m}" / f"{local_now:%d}"
@@ -230,8 +327,9 @@ async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await telegram_file.download_to_drive(custom_path=partial_path)
         partial_path.replace(final_path)
         relative_path = str(final_path.relative_to(settings.data_dir))
+        activity_type = activity["activity_type"] if activity else "speaking"
         submission_id = await service.db.add_submission(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             telegram_user_id=update.effective_user.id,
             telegram_message_id=message.message_id,
             kind=kind,
@@ -244,10 +342,13 @@ async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             telegram_file_unique_id=media.file_unique_id,
             created_at=iso_now(),
             local_date=settings.local_date(),
+            topic_id=activity.get("topic_id") if activity else None,
+            activity_type=activity_type,
         )
         if submission_id is None:
             final_path.unlink(missing_ok=True)
             return
+        pending_activities(context).pop(chat_id, None)
         await message.reply_text(settings.telegram_ack_message)
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         transcription = await service.groq.transcribe(final_path, mime_type)
@@ -258,28 +359,35 @@ async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             transcription_json=json.dumps(transcription, ensure_ascii=False),
             status="transcribed",
         )
-        await message.reply_text(f"Transcription archivée :\n{transcript}")
-        await process_saved_submission(update, context, submission_id, transcript, "audio transcrit")
+        await message.reply_text(f"Archived transcript:\n{transcript}")
+        await process_saved_submission(update, context, submission_id, transcript, "transcribed audio")
     except Exception as exc:
         partial_path.unlink(missing_ok=True)
         LOG.exception("Réception/transcription audio échouée")
         submission = await service.db.get_submission(submission_id) if "submission_id" in locals() and submission_id else None
         if submission:
             await service.db.update_submission(submission_id, status="failed", failure_reason=str(exc)[:1000])
-            await message.reply_text(f"Audio sauvegardé, mais traitement échoué (ID {submission_id}). Utilise /retry {submission_id}.")
+            await message.reply_text(f"The audio is saved, but processing failed (ID {submission_id}). Use /retry {submission_id}.")
         else:
-            await message.reply_text("Impossible d'archiver cet audio. Consulte les logs du conteneur.")
+            await message.reply_text("I could not archive this audio. Please check the application logs.")
 
 
 async def morning_job(context: CallbackContext) -> None:
     settings: Settings = context.application.bot_data["settings"]
     service = get_service(context)
     try:
-        topic, _ = await service.make_topic()
+        topic, _, topic_id = await service.make_topic()
         await send_text(context, settings.telegram_chat_id, service.format_topic(topic))
+        selected_mode = str(topic.get("mode") or "writing").strip().lower()
+        if selected_mode not in {"writing", "speaking"}:
+            selected_mode = "writing"
+        pending_activities(context)[settings.telegram_chat_id] = {
+            "topic_id": topic_id,
+            "activity_type": selected_mode,
+        }
     except Exception as exc:
         LOG.exception("Tâche matinale échouée")
-        await send_text(context, settings.telegram_chat_id, f"La génération du sujet a échoué : {str(exc)[:300]}")
+        await send_text(context, settings.telegram_chat_id, f"Exercise generation failed: {str(exc)[:300]}")
 
 
 async def evening_job(context: CallbackContext) -> None:
@@ -291,11 +399,11 @@ async def evening_job(context: CallbackContext) -> None:
         await send_text(
             context,
             settings.telegram_chat_id,
-            f"Bilan du soir\nFiches créées : {created}\nEnvoyées vers Anki : {pushed}\nEn attente : {remaining}",
+            f"Evening review\nCard proposals created: {created}\nSelected cards sent to Anki: {pushed}\nPending: {remaining}",
         )
     except Exception as exc:
         LOG.exception("Tâche du soir échouée")
-        await send_text(context, settings.telegram_chat_id, f"La création des fiches a échoué : {str(exc)[:300]}")
+        await send_text(context, settings.telegram_chat_id, f"Card creation failed: {str(exc)[:300]}")
 
 
 async def anki_retry_job(context: CallbackContext) -> None:
@@ -303,7 +411,7 @@ async def anki_retry_job(context: CallbackContext) -> None:
     try:
         pushed, remaining = await get_service(context).push_pending_cards()
         if pushed:
-            await send_text(context, settings.telegram_chat_id, f"Nouvel essai Anki : {pushed} fiche(s) envoyée(s), {remaining} restante(s).")
+            await send_text(context, settings.telegram_chat_id, f"Anki retry: {pushed} card(s) sent, {remaining} remaining.")
     except Exception:
         LOG.exception("Nouvel essai Anki échoué")
 
@@ -311,7 +419,7 @@ async def anki_retry_job(context: CallbackContext) -> None:
 async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if await is_authorized(update, settings):
-        await update.effective_message.reply_text("Format non pris en charge. Envoie du texte, une note vocale ou un fichier audio.")
+        await update.effective_message.reply_text("Unsupported format. Send a written message, voice note, or audio file.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -321,11 +429,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
-            BotCommand("topic", "Générer le sujet du jour"),
-            BotCommand("cards", "Créer et pousser les fiches Anki"),
-            BotCommand("stats", "Afficher les statistiques locales"),
-            BotCommand("retry", "Retraiter une production par ID"),
-            BotCommand("help", "Afficher l'aide"),
+            BotCommand("writing", "Start a writing exercise"),
+            BotCommand("speaking", "Start a speaking exercise"),
+            BotCommand("journaling", "Write freely about your day"),
+            BotCommand("topic", "Let the teacher choose an exercise"),
+            BotCommand("cards", "Generate or send selected cards"),
+            BotCommand("stats", "Show local learning statistics"),
+            BotCommand("retry", "Retry a production by ID"),
+            BotCommand("help", "Show all commands"),
         ]
     )
 
@@ -353,6 +464,9 @@ def build_application(settings: Settings, service: EnglishTeacherService) -> App
     application.bot_data.update({"settings": settings, "service": service})
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("writing", writing_command))
+    application.add_handler(CommandHandler("speaking", speaking_command))
+    application.add_handler(CommandHandler("journaling", journaling_command))
     application.add_handler(CommandHandler("topic", topic_command))
     application.add_handler(CommandHandler("cards", cards_command))
     application.add_handler(CommandHandler("stats", stats_command))
@@ -388,4 +502,3 @@ def build_application(settings: Settings, service: EnglishTeacherService) -> App
             job_kwargs={"misfire_grace_time": 3600, "coalesce": True},
         )
     return application
-

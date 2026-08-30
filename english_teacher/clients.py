@@ -62,10 +62,11 @@ class DeepSeekClient:
         }
         if self.settings.deepseek_reasoning_effort:
             body["reasoning_effort"] = self.settings.deepseek_reasoning_effort
-        if self.settings.deepseek_thinking_enabled:
-            body["thinking"] = {"type": "enabled"}
+        body["thinking"] = {"type": "enabled" if self.settings.deepseek_thinking_enabled else "disabled"}
         last_error: Exception | None = None
-        for _ in range(2):
+        last_finish_reason = "unknown"
+        last_content_length = 0
+        for attempt in range(2):
             response = await request_with_retries(
                 self.client,
                 "POST",
@@ -75,7 +76,10 @@ class DeepSeekClient:
             )
             try:
                 payload = response.json()
-                content = payload["choices"][0]["message"]["content"]
+                choice = payload["choices"][0]
+                last_finish_reason = str(choice.get("finish_reason") or "unknown")
+                content = choice["message"]["content"]
+                last_content_length = len(content or "")
                 if not content:
                     raise ValueError("réponse vide")
                 parsed = json.loads(clean_json_text(content))
@@ -84,8 +88,15 @@ class DeepSeekClient:
                 return parsed
             except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
                 last_error = exc
-                body["messages"][1]["content"] += "\nIMPORTANT: réponds avec un objet JSON complet et valide, sans bloc Markdown."
-        raise ApiError(f"JSON DeepSeek invalide: {last_error}")
+                if attempt == 0:
+                    body["max_tokens"] = int(body["max_tokens"]) * 2
+                    body["messages"][1]["content"] += (
+                        "\nIMPORTANT: return one complete valid JSON object only, with no Markdown fence."
+                    )
+        raise ApiError(
+            f"Invalid DeepSeek JSON: {last_error}; finish_reason={last_finish_reason}; "
+            f"content_length={last_content_length}"
+        )
 
 
 class GroqClient:
@@ -157,7 +168,8 @@ class AnkiConnectClient:
             await self.invoke("createDeck", deck=self.settings.anki_deck)
 
     async def push_card(self, card: Mapping[str, Any]) -> int:
-        unique_tag = f"english_ai_card_{card['id']}"
+        source = str(card.get("_source_table") or "cards")
+        unique_tag = f"english_ai_{source}_{card['id']}"
         existing = await self.invoke("findNotes", query=f"tag:{unique_tag}")
         if existing:
             return int(existing[0])
@@ -176,4 +188,3 @@ class AnkiConnectClient:
         if note_id is None:
             raise ApiError("AnkiConnect n'a pas créé la note")
         return int(note_id)
-

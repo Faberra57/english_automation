@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -15,6 +16,17 @@ from .telegram_app import build_application
 
 
 LOG = logging.getLogger("english_teacher")
+TELEGRAM_TOKEN_RE = re.compile(r"(?i)(bot)\d+:[A-Za-z0-9_-]+")
+
+
+class RedactSecretsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = TELEGRAM_TOKEN_RE.sub(r"\1<redacted>", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
 
 
 async def initialize_only(settings: Settings) -> None:
@@ -46,6 +58,10 @@ def main() -> None:
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RedactSecretsFilter())
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     asyncio.run(initialize_only(settings))
     if args.check or args.healthcheck:
         print(f"OK: configuration valide, SQLite accessible ({settings.database_path})")
@@ -64,4 +80,3 @@ def main() -> None:
         settings.anki_enabled,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
-

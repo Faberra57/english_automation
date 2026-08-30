@@ -21,6 +21,9 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY --chown=app:app bot.py ./bot.py
+COPY --chown=app:app streamlit_app.py ./streamlit_app.py
+COPY --chown=app:app dashboard_pages ./dashboard_pages
+COPY --chown=app:app .streamlit ./.streamlit
 COPY --chown=app:app english_teacher ./english_teacher
 
 USER app
