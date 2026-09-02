@@ -71,7 +71,6 @@ services:
     container_name: english-teacher-anki
     profiles: ["anki"]
     restart: unless-stopped
-    init: true
     environment:
       PUID: ${APP_UID:-1000}
       PGID: ${APP_GID:-1000}
