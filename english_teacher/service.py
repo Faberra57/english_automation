@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from pathlib import Path
 from typing import Any, Mapping
 
-from .clients import AnkiConnectClient, DeepSeekClient, GroqClient
+from .clients import AnkiConnectClient, DeepSeekClient, ElevenLabsTranscriptionClient, XAITranscriptionClient
 from .config import Settings
 from .database import Database
 from .utils import iso_now
@@ -19,11 +21,45 @@ class EnglishTeacherService:
         self.settings = settings
         self.db = database
         self.deepseek = DeepSeekClient(settings)
-        self.groq = GroqClient(settings)
+        self.transcription = XAITranscriptionClient(settings)
+        self.elevenlabs_transcription = ElevenLabsTranscriptionClient(settings)
         self.anki = AnkiConnectClient(settings)
 
     async def close(self) -> None:
-        await asyncio.gather(self.deepseek.close(), self.groq.close(), self.anki.close())
+        await asyncio.gather(
+            self.deepseek.close(),
+            self.transcription.close(),
+            self.elevenlabs_transcription.close(),
+            self.anki.close(),
+        )
+
+    async def compare_transcriptions(self, path: Path, mime_type: str | None) -> dict[str, dict[str, Any]]:
+        providers = {"xai": self.transcription}
+        if self.settings.stt_comparison_enabled:
+            providers["elevenlabs"] = self.elevenlabs_transcription
+
+        async def run(provider: str) -> tuple[str, dict[str, Any]]:
+            started = time.perf_counter()
+            try:
+                response = await providers[provider].transcribe(path, mime_type)
+                return provider, {
+                    "status": "succeeded",
+                    "transcript": str(response["text"]).strip(),
+                    "response": response,
+                    "latency_ms": round((time.perf_counter() - started) * 1000),
+                }
+            except Exception as exc:
+                LOG.warning("Transcription %s échouée: %s", provider, exc)
+                return provider, {
+                    "status": "failed",
+                    "transcript": None,
+                    "response": None,
+                    "error": str(exc)[:1000],
+                    "latency_ms": round((time.perf_counter() - started) * 1000),
+                }
+
+        results = await asyncio.gather(*(run(provider) for provider in providers))
+        return dict(results)
 
     async def correct(self, submission_id: int, production: str, kind: str) -> dict[str, Any]:
         rag = await self.db.rag_context(production)
@@ -141,7 +177,7 @@ Generate today's exercise as JSON."""
         lines.extend(["", instruction])
         return "\n".join(lines)
 
-    async def generate_cards(self, local_date: str) -> int:
+    async def generate_cards(self, local_date: str, *, source_submission_id: int | None = None) -> int:
         if await self.db.proposal_count(local_date):
             return 0
         context = await self.db.card_generation_context(local_date)
@@ -199,22 +235,49 @@ The theme vocabulary should include sophisticated words the learner could natura
                 tags = raw_card.get("tags") if isinstance(raw_card.get("tags"), list) else []
                 cards.append({**raw_card, "front": front, "back": back, "tags": [category, *tags]})
             groups[category] = cards
-        return await self.db.create_card_proposals(local_date, groups)
+        return await self.db.create_card_proposals(
+            local_date,
+            groups,
+            source_submission_id=source_submission_id,
+        )
 
-    async def push_pending_cards(self) -> tuple[int, int]:
-        legacy = [{**card, "_source_table": "cards"} for card in await self.db.pending_cards()]
+    async def push_pending_cards(self, *, local_date: str | None = None) -> tuple[int, int]:
+        result = await self.push_pending_cards_detailed(local_date=local_date)
+        return int(result["pushed"]), int(result["remaining"])
+
+    async def push_pending_cards_detailed(self, *, local_date: str | None = None) -> dict[str, Any]:
+        legacy = (
+            [{**card, "_source_table": "cards"} for card in await self.db.pending_cards()]
+            if local_date is None
+            else []
+        )
         proposals = [
-            {**card, "_source_table": "card_proposals"} for card in await self.db.pending_card_proposals()
+            {**card, "_source_table": "card_proposals"}
+            for card in await self.db.pending_card_proposals(local_date=local_date)
         ]
         pending = [*legacy, *proposals]
         if not pending or not self.settings.anki_enabled:
-            return 0, len(pending)
+            return {
+                "pushed": 0,
+                "remaining": len(pending),
+                "sync_attempted": False,
+                "sync_succeeded": False,
+                "sync_error": None,
+                "anki_enabled": self.settings.anki_enabled,
+            }
         pushed = 0
         try:
             await self.anki.ensure_deck()
         except Exception as exc:
             LOG.warning("AnkiConnect indisponible avant envoi: %s", exc)
-            return 0, len(pending)
+            return {
+                "pushed": 0,
+                "remaining": len(pending),
+                "sync_attempted": False,
+                "sync_succeeded": False,
+                "sync_error": f"AnkiConnect unavailable: {str(exc)[:500]}",
+                "anki_enabled": True,
+            }
         for card in pending:
             try:
                 note_id = await self.anki.push_card(card)
@@ -229,9 +292,21 @@ The theme vocabulary should include sophisticated words the learner could natura
                     await self.db.update_card_proposal(card["id"], status="failed", error=str(exc)[:1000])
                 else:
                     await self.db.update_card(card["id"], status="failed", error=str(exc)[:1000])
-        if pushed and self.settings.anki_sync_after_push:
+        sync_attempted = bool(pushed and self.settings.anki_sync_after_push)
+        sync_succeeded = False
+        sync_error: str | None = None
+        if sync_attempted:
             try:
                 await self.anki.invoke("sync")
+                sync_succeeded = True
             except Exception as exc:
                 LOG.warning("Cartes créées mais synchronisation Anki échouée: %s", exc)
-        return pushed, len(pending) - pushed
+                sync_error = str(exc)[:500]
+        return {
+            "pushed": pushed,
+            "remaining": len(pending) - pushed,
+            "sync_attempted": sync_attempted,
+            "sync_succeeded": sync_succeeded,
+            "sync_error": sync_error,
+            "anki_enabled": True,
+        }

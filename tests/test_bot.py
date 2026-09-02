@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import date
 from pathlib import Path
 
 import httpx
 import pytest
 
-from english_teacher.clients import DeepSeekClient
+from english_teacher.clients import DeepSeekClient, ElevenLabsTranscriptionClient, XAITranscriptionClient
 from english_teacher.config import Settings, parse_clock, parse_days
 from english_teacher.database import Database
 from english_teacher.dashboard import annotate_text, annotate_text_diff
@@ -24,7 +25,8 @@ def make_settings(tmp_path: Path, **overrides: str) -> Settings:
         "TELEGRAM_ALLOWED_USER_IDS": "42",
         "TELEGRAM_CHAT_ID": "42",
         "DEEPSEEK_API_KEY": "deepseek-test",
-        "GROQ_API_KEY": "groq-test",
+        "XAI_API_KEY": "xai-test",
+        "ELEVENLABS_API_KEY": "elevenlabs-test",
         "DATA_DIR": str(tmp_path),
         "DATABASE_PATH": str(tmp_path / "teacher.sqlite3"),
         "AUDIO_DIR": str(tmp_path / "audio"),
@@ -52,6 +54,236 @@ def test_input_mode_defaults_to_both_and_validates(tmp_path: Path) -> None:
     assert make_settings(tmp_path, INPUT_MODE=" AUDIO_ONLY ").input_mode == "audio_only"
     with pytest.raises(ValueError, match="INPUT_MODE invalide"):
         make_settings(tmp_path, INPUT_MODE="text")
+
+
+@pytest.mark.asyncio
+async def test_xai_transcription_uses_stt_endpoint_and_documented_multipart(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"fake-ogg-audio")
+    client = XAITranscriptionClient(settings)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.x.ai/v1/stt"
+        assert request.headers["Authorization"] == "Bearer xai-test"
+        content_type = request.headers["Content-Type"]
+        assert content_type.startswith("multipart/form-data; boundary=")
+        body = request.content
+        format_position = body.index(b'name="format"')
+        language_position = body.index(b'name="language"')
+        file_position = body.index(b'name="file"')
+        assert format_position < file_position
+        assert language_position < file_position
+        assert b'name="model"' not in body
+        assert b"fake-ogg-audio" in body
+        return httpx.Response(
+            200,
+            json={"text": "I went skating.", "language": "en", "duration": 2.4, "words": []},
+        )
+
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": f"Bearer {settings.xai_api_key}"},
+    )
+    try:
+        result = await client.transcribe(audio_path, "audio/ogg")
+        assert result["text"] == "I went skating."
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_transcription_uses_scribe_v2_endpoint(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"fake-ogg-audio")
+    client = ElevenLabsTranscriptionClient(settings)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.elevenlabs.io/v1/speech-to-text"
+        assert request.headers["xi-api-key"] == "elevenlabs-test"
+        body = request.content
+        assert b'name="model_id"' in body and b"scribe_v2" in body
+        assert b'name="language_code"' in body and b"eng" in body
+        assert b'name="tag_audio_events"' in body and b"false" in body
+        assert b'name="file"' in body and b"fake-ogg-audio" in body
+        return httpx.Response(
+            200,
+            json={"text": "I went skateboarding.", "language_code": "en", "words": []},
+        )
+
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers={"xi-api-key": settings.elevenlabs_api_key},
+    )
+    try:
+        result = await client.transcribe(audio_path, "audio/ogg")
+        assert result["text"] == "I went skateboarding."
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_transcript_choice_is_persisted_before_processing(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings)
+    await database.initialize()
+    submission_id = await database.add_submission(
+        chat_id=42,
+        telegram_user_id=42,
+        telegram_message_id=12,
+        kind="voice",
+        raw_text=None,
+        audio_path="audio/test.ogg",
+        audio_original_name="test.ogg",
+        audio_mime_type="audio/ogg",
+        audio_sha256="abc",
+        telegram_file_id="file",
+        telegram_file_unique_id="unique",
+        created_at="2026-08-30T08:00:00+00:00",
+        local_date="2026-08-30",
+        activity_type="speaking",
+    )
+    assert submission_id is not None
+    await database.replace_transcription_candidates(
+        submission_id,
+        {
+            "xai": {
+                "status": "succeeded",
+                "transcript": "I make a test.",
+                "response": {"text": "I make a test."},
+                "latency_ms": 700,
+            },
+            "elevenlabs": {
+                "status": "succeeded",
+                "transcript": "I made a test.",
+                "response": {"text": "I made a test."},
+                "latency_ms": 900,
+            },
+        },
+    )
+    await database.update_submission(submission_id, status="awaiting_transcript_choice")
+    repository = DashboardRepository(settings.database_path)
+    journal = repository.journal(
+        start_date=date.fromisoformat("2026-08-30"),
+        end_date=date.fromisoformat("2026-08-30"),
+    )
+    candidates = journal["submissions"][0]["transcription_candidates"]
+    elevenlabs = next(item for item in candidates if item["provider"] == "elevenlabs")
+    selection = repository.choose_transcription(submission_id, int(elevenlabs["id"]))
+    assert selection["provider"] == "elevenlabs"
+    assert selection["transcript"] == "I made a test."
+    stored = await database.get_submission(submission_id)
+    assert stored and stored["status"] == "transcribed"
+    assert stored["transcript"] == "I made a test."
+    with pytest.raises(ValueError, match="déjà été choisie"):
+        repository.choose_transcription(submission_id, int(elevenlabs["id"]))
+    statistics = repository.statistics()
+    assert statistics["transcription_provider_choices"] == [
+        {"provider": "elevenlabs", "count": 1, "percentage": 100.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_deletes_complete_submission_and_audio(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    database = Database(settings)
+    await database.initialize()
+    audio_path = settings.audio_dir / "delete-me.ogg"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(b"audio-to-delete")
+    topic_id = await database.save_topic(
+        "2026-08-30",
+        {"title": "Delete test", "mode": "speaking", "prompt": "Test deletion."},
+        "test",
+    )
+    submission_id = await database.add_submission(
+        chat_id=42,
+        telegram_user_id=42,
+        telegram_message_id=13,
+        kind="voice",
+        raw_text=None,
+        audio_path=str(audio_path.relative_to(settings.data_dir)),
+        audio_original_name="delete-me.ogg",
+        audio_mime_type="audio/ogg",
+        audio_sha256="def",
+        telegram_file_id="file-delete",
+        telegram_file_unique_id="unique-delete",
+        created_at="2026-08-30T09:00:00+00:00",
+        local_date="2026-08-30",
+        activity_type="speaking",
+        topic_id=topic_id,
+    )
+    assert submission_id is not None
+    await database.replace_transcription_candidates(
+        submission_id,
+        {
+            "xai": {
+                "status": "succeeded",
+                "transcript": "I delete this test.",
+                "response": {"text": "I delete this test."},
+                "latency_ms": 500,
+            },
+            "elevenlabs": {
+                "status": "succeeded",
+                "transcript": "I deleted this test.",
+                "response": {"text": "I deleted this test."},
+                "latency_ms": 600,
+            },
+        },
+    )
+    await database.replace_errors(
+        submission_id,
+        [{"category": "tense", "original": "delete", "corrected": "deleted"}],
+        5,
+    )
+    error = (await database.uncarded_errors("2026-08-30", 5))[0]
+    assert await database.create_cards(
+        [{"error_id": error["id"], "front": "delete", "back": "deleted", "tags": []}]
+    ) == 1
+    repository = DashboardRepository(settings.database_path)
+    journal = repository.journal(
+        start_date=date.fromisoformat("2026-08-30"),
+        end_date=date.fromisoformat("2026-08-30"),
+    )
+    candidate = journal["submissions"][0]["transcription_candidates"][0]
+    repository.choose_transcription(submission_id, int(candidate["id"]))
+    assert await database.create_card_proposals(
+        "2026-08-30",
+        {
+            "theme_vocabulary": [
+                {"front": "A temporary proposal", "back": "Temporary", "tags": ["test"]}
+            ]
+        },
+        source_submission_id=submission_id,
+    ) == 1
+
+    deleted = repository.delete_submission(
+        submission_id,
+        data_dir=settings.data_dir,
+        audio_dir=settings.audio_dir,
+    )
+    assert deleted == {"submission_id": submission_id, "audio_deleted": True}
+    assert not audio_path.exists()
+    assert await database.get_submission(submission_id) is None
+    with sqlite3.connect(settings.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM transcription_candidates WHERE submission_id=?", (submission_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM transcription_choices WHERE submission_id=?", (submission_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM errors WHERE submission_id=?", (submission_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM card_proposals WHERE source_submission_id=?", (submission_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM activity_topics").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM topics").fetchone()[0] == 0
 
 
 @pytest.mark.asyncio
@@ -437,5 +669,44 @@ async def test_card_proposals_are_grouped_selected_and_retained(tmp_path: Path) 
         assert sum(card["status"] == "proposed" for card in refreshed) == 13
         assert len(await db.pending_card_proposals()) == 7
         assert await service.push_pending_cards() == (0, 7)
+
+        enabled_settings = make_settings(
+            tmp_path,
+            ANKI_ENABLED="true",
+            ANKI_SYNC_AFTER_PUSH="true",
+        )
+        enabled_service = EnglishTeacherService(enabled_settings, db)
+        pushed_ids: list[int] = []
+        invoked_actions: list[str] = []
+
+        async def fake_ensure_deck() -> None:
+            return None
+
+        async def fake_push_card(card: dict[str, object]) -> int:
+            pushed_ids.append(int(card["id"]))
+            return 10_000 + int(card["id"])
+
+        async def fake_invoke(action: str, **params: object) -> None:
+            invoked_actions.append(action)
+
+        enabled_service.anki.ensure_deck = fake_ensure_deck  # type: ignore[method-assign]
+        enabled_service.anki.push_card = fake_push_card  # type: ignore[method-assign]
+        enabled_service.anki.invoke = fake_invoke  # type: ignore[method-assign]
+        try:
+            result = await enabled_service.push_pending_cards_detailed(local_date="2026-08-28")
+            assert result == {
+                "pushed": 7,
+                "remaining": 0,
+                "sync_attempted": True,
+                "sync_succeeded": True,
+                "sync_error": None,
+                "anki_enabled": True,
+            }
+            assert set(pushed_ids) == chosen
+            assert invoked_actions == ["sync"]
+            refreshed = repository.card_proposals("2026-08-28")
+            assert sum(card["status"] == "pushed" for card in refreshed) == 7
+        finally:
+            await enabled_service.close()
     finally:
         await service.close()

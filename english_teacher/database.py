@@ -51,6 +51,29 @@ CREATE TABLE IF NOT EXISTS submissions (
 );
 CREATE INDEX IF NOT EXISTS idx_submissions_date ON submissions(local_date, created_at);
 
+CREATE TABLE IF NOT EXISTS transcription_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK(provider IN ('xai','elevenlabs')),
+    transcript TEXT,
+    response_json TEXT,
+    status TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
+    error TEXT,
+    latency_ms INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE(submission_id, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_transcription_candidates_submission
+    ON transcription_candidates(submission_id, provider);
+
+CREATE TABLE IF NOT EXISTS transcription_choices (
+    submission_id INTEGER PRIMARY KEY REFERENCES submissions(id) ON DELETE CASCADE,
+    candidate_id INTEGER NOT NULL REFERENCES transcription_candidates(id),
+    provider TEXT NOT NULL CHECK(provider IN ('xai','elevenlabs')),
+    chosen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transcription_choices_date ON transcription_choices(chosen_at, provider);
+
 CREATE TABLE IF NOT EXISTS errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
@@ -94,6 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status, created_at);
 
 CREATE TABLE IF NOT EXISTS card_proposals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_submission_id INTEGER REFERENCES submissions(id) ON DELETE CASCADE,
     local_date TEXT NOT NULL,
     category TEXT NOT NULL CHECK(category IN (
         'theme_vocabulary','useful_structure','grammar_error','vocabulary_error'
@@ -151,6 +175,14 @@ class Database:
                 await db.execute("ALTER TABLE submissions ADD COLUMN topic_id INTEGER REFERENCES activity_topics(id)")
             if "activity_type" not in columns:
                 await db.execute("ALTER TABLE submissions ADD COLUMN activity_type TEXT")
+            proposal_columns = {
+                row[1] for row in await (await db.execute("PRAGMA table_info(card_proposals)")).fetchall()
+            }
+            if "source_submission_id" not in proposal_columns:
+                await db.execute(
+                    "ALTER TABLE card_proposals ADD COLUMN source_submission_id INTEGER "
+                    "REFERENCES submissions(id) ON DELETE CASCADE"
+                )
             await db.commit()
         finally:
             await db.close()
@@ -192,6 +224,40 @@ class Database:
         try:
             row = await (await db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,))).fetchone()
             return dict(row) if row else None
+        finally:
+            await db.close()
+
+    async def replace_transcription_candidates(
+        self, submission_id: int, candidates: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        db = await self.connect()
+        try:
+            existing_choice = await (
+                await db.execute("SELECT 1 FROM transcription_choices WHERE submission_id=?", (submission_id,))
+            ).fetchone()
+            if existing_choice:
+                raise ValueError("Une transcription a déjà été choisie pour cette production")
+            await db.execute("DELETE FROM transcription_candidates WHERE submission_id=?", (submission_id,))
+            for provider, candidate in candidates.items():
+                if provider not in {"xai", "elevenlabs"}:
+                    raise ValueError(f"Fournisseur STT inconnu: {provider}")
+                response = candidate.get("response")
+                await db.execute(
+                    """INSERT INTO transcription_candidates
+                       (submission_id,provider,transcript,response_json,status,error,latency_ms,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        submission_id,
+                        provider,
+                        candidate.get("transcript"),
+                        json.dumps(response, ensure_ascii=False) if response is not None else None,
+                        candidate.get("status"),
+                        candidate.get("error"),
+                        candidate.get("latency_ms"),
+                        iso_now(),
+                    ),
+                )
+            await db.commit()
         finally:
             await db.close()
 
@@ -370,7 +436,13 @@ class Database:
         finally:
             await db.close()
 
-    async def create_card_proposals(self, local_date: str, groups: Mapping[str, Sequence[Mapping[str, Any]]]) -> int:
+    async def create_card_proposals(
+        self,
+        local_date: str,
+        groups: Mapping[str, Sequence[Mapping[str, Any]]],
+        *,
+        source_submission_id: int | None = None,
+    ) -> int:
         created = 0
         db = await self.connect()
         try:
@@ -381,9 +453,10 @@ class Database:
                         raw_tags = []
                     cursor = await db.execute(
                         """INSERT OR IGNORE INTO card_proposals
-                           (local_date,category,position,front,back,rationale,tags_json,created_at)
-                           VALUES(?,?,?,?,?,?,?,?)""",
+                           (source_submission_id,local_date,category,position,front,back,rationale,tags_json,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
                         (
+                            source_submission_id,
                             local_date,
                             category,
                             position,
@@ -400,15 +473,21 @@ class Database:
         finally:
             await db.close()
 
-    async def pending_card_proposals(self, limit: int = 100) -> list[dict[str, Any]]:
+    async def pending_card_proposals(
+        self, limit: int = 100, *, local_date: str | None = None
+    ) -> list[dict[str, Any]]:
         db = await self.connect()
         try:
-            rows = await (await db.execute(
-                """SELECT * FROM card_proposals
-                   WHERE selected=1 AND status IN ('pending','failed')
-                   ORDER BY selected_at,created_at,id LIMIT ?""",
-                (limit,),
-            )).fetchall()
+            date_clause = " AND local_date=?" if local_date else ""
+            params: tuple[Any, ...] = (local_date, limit) if local_date else (limit,)
+            rows = await (
+                await db.execute(
+                    f"""SELECT * FROM card_proposals
+                       WHERE selected=1 AND status IN ('pending','failed'){date_clause}
+                       ORDER BY selected_at,created_at,id LIMIT ?""",
+                    params,
+                )
+            ).fetchall()
             return [dict(row) for row in rows]
         finally:
             await db.close()

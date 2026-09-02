@@ -94,7 +94,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/topic — let the teacher choose writing or speaking\n"
         "/stats — show your local learning counters\n"
         "/retry <id> — retry a failed production\n"
-        "/cards — generate 20 proposals, or send your selected cards to Anki\n"
+        "/cards — generate 20 proposals, or manually retry a failed Anki export\n"
         "/help — show this command summary\n\n"
         f"Active input mode: {input_mode_description(settings.input_mode)}.\n"
         "Automatic tasks follow the schedule and timezone configured in .env."
@@ -167,7 +167,8 @@ async def cards_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         pushed, remaining = await service.push_pending_cards()
         await update.effective_message.reply_text(
-            f"No new proposals were needed. Selected cards sent to Anki: {pushed}\nPending: {remaining}"
+            f"Manual Anki retry complete. Cards sent: {pushed}\nPending: {remaining}. "
+            "Normally, validating your selection in Streamlit sends the cards automatically."
         )
     except Exception:
         LOG.exception("Création manuelle des cartes échouée")
@@ -208,11 +209,21 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             audio_path = Path(submission["audio_path"])
             if not audio_path.is_absolute():
                 audio_path = settings.data_dir / audio_path
-            transcription = await service.groq.transcribe(audio_path, submission["audio_mime_type"])
-            production = transcription["text"].strip()
+            candidates = await service.compare_transcriptions(audio_path, submission["audio_mime_type"])
+            await service.db.replace_transcription_candidates(submission_id, candidates)
+            succeeded = sum(candidate["status"] == "succeeded" for candidate in candidates.values())
+            if not succeeded:
+                raise ValueError("all transcription providers failed")
             await service.db.update_submission(
-                submission_id, transcript=production, transcription_json=json.dumps(transcription, ensure_ascii=False)
+                submission_id,
+                status="awaiting_transcript_choice",
+                failure_reason=None,
             )
+            await update.effective_message.reply_text(
+                f"{succeeded} transcript option(s) ready for production {submission_id}. "
+                "Open the Journal page in Streamlit and choose the transcript to continue."
+            )
+            return
         if not production:
             raise ValueError("no content to retry")
         production_type = submission.get("activity_type") or (
@@ -349,18 +360,26 @@ async def audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             final_path.unlink(missing_ok=True)
             return
         pending_activities(context).pop(chat_id, None)
-        await message.reply_text(settings.telegram_ack_message)
+        await message.reply_text(
+            "Got it — I’m comparing the xAI and ElevenLabs transcripts. "
+            "I’ll wait for your choice in Streamlit before correcting it."
+        )
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        transcription = await service.groq.transcribe(final_path, mime_type)
-        transcript = str(transcription["text"]).strip()
+        candidates = await service.compare_transcriptions(final_path, mime_type)
+        await service.db.replace_transcription_candidates(submission_id, candidates)
+        succeeded = sum(candidate["status"] == "succeeded" for candidate in candidates.values())
+        if not succeeded:
+            raise ValueError("all transcription providers failed")
         await service.db.update_submission(
             submission_id,
-            transcript=transcript,
-            transcription_json=json.dumps(transcription, ensure_ascii=False),
-            status="transcribed",
+            status="awaiting_transcript_choice",
+            failure_reason=None,
         )
-        await message.reply_text(f"Archived transcript:\n{transcript}")
-        await process_saved_submission(update, context, submission_id, transcript, "transcribed audio")
+        await message.reply_text(
+            f"Your audio is archived and {succeeded} transcript option(s) are ready. "
+            "Open the Journal page in Streamlit, listen to the audio, and choose the best transcript. "
+            "The correction and cards will only be generated after your choice."
+        )
     except Exception as exc:
         partial_path.unlink(missing_ok=True)
         LOG.exception("Réception/transcription audio échouée")
@@ -433,7 +452,7 @@ async def post_init(application: Application) -> None:
             BotCommand("speaking", "Start a speaking exercise"),
             BotCommand("journaling", "Write freely about your day"),
             BotCommand("topic", "Let the teacher choose an exercise"),
-            BotCommand("cards", "Generate or send selected cards"),
+            BotCommand("cards", "Generate cards or retry Anki export"),
             BotCommand("stats", "Show local learning statistics"),
             BotCommand("retry", "Retry a production by ID"),
             BotCommand("help", "Show all commands"),

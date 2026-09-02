@@ -93,13 +93,19 @@ class Settings:
     deepseek_max_retries: int
     deepseek_reasoning_effort: str
     deepseek_thinking_enabled: bool
-    groq_api_key: str
-    groq_base_url: str
-    groq_model: str
-    groq_language: str
-    groq_prompt: str
-    groq_timeout: float
-    groq_max_retries: int
+    xai_api_key: str
+    xai_stt_url: str
+    xai_stt_language: str
+    xai_stt_format: bool
+    xai_stt_timeout: float
+    xai_stt_max_retries: int
+    stt_comparison_enabled: bool
+    elevenlabs_api_key: str
+    elevenlabs_stt_url: str
+    elevenlabs_stt_model: str
+    elevenlabs_stt_language: str
+    elevenlabs_stt_timeout: float
+    elevenlabs_stt_max_retries: int
     learner_name: str
     learner_level: str
     explanation_language: str
@@ -177,13 +183,23 @@ class Settings:
             deepseek_max_retries=env_int(env, "DEEPSEEK_MAX_RETRIES", 3, 1),
             deepseek_reasoning_effort=env.get("DEEPSEEK_REASONING_EFFORT", "").strip(),
             deepseek_thinking_enabled=env_bool(env.get("DEEPSEEK_THINKING_ENABLED"), False),
-            groq_api_key=env.get("GROQ_API_KEY", "").strip(),
-            groq_base_url=env.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"),
-            groq_model=env.get("GROQ_WHISPER_MODEL", "whisper-large-v3"),
-            groq_language=env.get("GROQ_LANGUAGE", "en"),
-            groq_prompt=env.get("GROQ_TRANSCRIPTION_PROMPT", "English learner speaking practice. Preserve mistakes exactly."),
-            groq_timeout=env_float(env, "GROQ_TIMEOUT_SECONDS", 180, 1),
-            groq_max_retries=env_int(env, "GROQ_MAX_RETRIES", 3, 1),
+            # GROQ_API_KEY is kept as a temporary compatibility alias so an
+            # existing local .env containing an xAI key keeps working.
+            xai_api_key=(env.get("XAI_API_KEY", "").strip() or env.get("GROQ_API_KEY", "").strip()),
+            xai_stt_url=env.get("XAI_STT_URL", "https://api.x.ai/v1/stt").strip(),
+            xai_stt_language=env.get("XAI_STT_LANGUAGE", "en").strip(),
+            xai_stt_format=env_bool(env.get("XAI_STT_FORMAT"), True),
+            xai_stt_timeout=env_float(env, "XAI_STT_TIMEOUT_SECONDS", 180, 1),
+            xai_stt_max_retries=env_int(env, "XAI_STT_MAX_RETRIES", 3, 1),
+            stt_comparison_enabled=env_bool(env.get("STT_COMPARISON_ENABLED"), True),
+            elevenlabs_api_key=env.get("ELEVENLABS_API_KEY", "").strip(),
+            elevenlabs_stt_url=env.get(
+                "ELEVENLABS_STT_URL", "https://api.elevenlabs.io/v1/speech-to-text"
+            ).strip(),
+            elevenlabs_stt_model=env.get("ELEVENLABS_STT_MODEL", "scribe_v2").strip(),
+            elevenlabs_stt_language=env.get("ELEVENLABS_STT_LANGUAGE", "eng").strip(),
+            elevenlabs_stt_timeout=env_float(env, "ELEVENLABS_STT_TIMEOUT_SECONDS", 180, 1),
+            elevenlabs_stt_max_retries=env_int(env, "ELEVENLABS_STT_MAX_RETRIES", 3, 1),
             learner_name=env.get("LEARNER_NAME", "Learner"),
             learner_level=env.get("LEARNER_LEVEL", "B1"),
             explanation_language=env.get("EXPLANATION_LANGUAGE", "English"),
@@ -227,8 +243,14 @@ class Settings:
             errors.append("TELEGRAM_CHAT_ID manquant")
         if require_secrets and (not self.deepseek_api_key or self.deepseek_api_key == "replace_me"):
             errors.append("DEEPSEEK_API_KEY manquant")
-        if require_secrets and (not self.groq_api_key or self.groq_api_key == "replace_me"):
-            errors.append("GROQ_API_KEY manquant")
+        if require_secrets and (not self.xai_api_key or self.xai_api_key == "replace_me"):
+            errors.append("XAI_API_KEY manquant")
+        if (
+            require_secrets
+            and self.stt_comparison_enabled
+            and (not self.elevenlabs_api_key or self.elevenlabs_api_key == "replace_me")
+        ):
+            errors.append("ELEVENLABS_API_KEY manquant alors que STT_COMPARISON_ENABLED=true")
         if self.telegram_chat_id not in self.allowed_user_ids:
             errors.append("TELEGRAM_CHAT_ID doit aussi être présent dans TELEGRAM_ALLOWED_USER_IDS")
         if errors:

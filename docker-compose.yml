@@ -6,13 +6,16 @@ services:
     container_name: english-teacher
     restart: unless-stopped
     init: true
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
     env_file:
       - .env
+    environment:
+      DATA_DIR: /app/data
+      DATABASE_PATH: /app/data/english_teacher.sqlite3
+      AUDIO_DIR: /app/data/audio
+      ANKICONNECT_URL: http://anki:8765
     volumes:
       - ./data:/app/data
-    # Sur un serveur Linux, ceci permet de joindre AnkiConnect sur 127.0.0.1:8765
-    # tout en le laissant lié au loopback de l'hôte.
-    network_mode: host
     read_only: true
     tmpfs:
       - /tmp:size=128m,mode=1777
@@ -29,10 +32,14 @@ services:
     container_name: english-teacher-dashboard
     restart: unless-stopped
     init: true
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    env_file:
+      - .env
     environment:
       DATA_DIR: /app/data
       DATABASE_PATH: /app/data/english_teacher.sqlite3
       AUDIO_DIR: /app/data/audio
+      ANKICONNECT_URL: http://anki:8765
       TZ: ${TZ:-Europe/Paris}
     command:
       - streamlit
@@ -58,3 +65,23 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+
+  anki:
+    image: chrislongros/anki-desktop:latest
+    container_name: english-teacher-anki
+    profiles: ["anki"]
+    restart: unless-stopped
+    init: true
+    environment:
+      PUID: ${APP_UID:-1000}
+      PGID: ${APP_GID:-1000}
+      TZ: ${TZ:-Europe/Paris}
+    volumes:
+      - ./anki-data:/config
+    # Interface graphique Anki locale uniquement. Utiliser un tunnel SSH.
+    ports:
+      - "127.0.0.1:3000:3000"
+    shm_size: 1gb
+    security_opt:
+      - seccomp=unconfined
+      - no-new-privileges:true

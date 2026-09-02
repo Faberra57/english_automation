@@ -99,12 +99,12 @@ class DeepSeekClient:
         )
 
 
-class GroqClient:
+class XAITranscriptionClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.groq_timeout),
-            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+            timeout=httpx.Timeout(settings.xai_stt_timeout),
+            headers={"Authorization": f"Bearer {settings.xai_api_key}"},
         )
 
     async def close(self) -> None:
@@ -112,17 +112,14 @@ class GroqClient:
 
     async def transcribe(self, path: Path, mime_type: str | None) -> dict[str, Any]:
         last_error: Exception | None = None
-        for attempt in range(1, self.settings.groq_max_retries + 1):
+        for attempt in range(1, self.settings.xai_stt_max_retries + 1):
             try:
                 with path.open("rb") as audio:
                     response = await self.client.post(
-                        f"{self.settings.groq_base_url}/audio/transcriptions",
+                        self.settings.xai_stt_url,
                         data={
-                            "model": self.settings.groq_model,
-                            "language": self.settings.groq_language,
-                            "prompt": self.settings.groq_prompt,
-                            "response_format": "verbose_json",
-                            "temperature": "0",
+                            "format": str(self.settings.xai_stt_format).lower(),
+                            "language": self.settings.xai_stt_language,
                         },
                         files={"file": (path.name, audio, mime_type or "application/octet-stream")},
                     )
@@ -131,13 +128,53 @@ class GroqClient:
                 response.raise_for_status()
                 result = response.json()
                 if not str(result.get("text", "")).strip():
-                    raise ApiError("Transcription Groq vide")
+                    raise ApiError("Transcription xAI vide")
                 return result
             except (httpx.HTTPError, ApiError, json.JSONDecodeError) as exc:
                 last_error = exc
-                if attempt < self.settings.groq_max_retries:
+                if attempt < self.settings.xai_stt_max_retries:
                     await asyncio.sleep(min(8, 2 ** (attempt - 1)))
-        raise ApiError(f"Échec transcription Groq: {last_error}")
+        raise ApiError(f"Échec transcription xAI: {last_error}")
+
+
+class ElevenLabsTranscriptionClient:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.elevenlabs_stt_timeout),
+            headers={"xi-api-key": settings.elevenlabs_api_key},
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def transcribe(self, path: Path, mime_type: str | None) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, self.settings.elevenlabs_stt_max_retries + 1):
+            try:
+                with path.open("rb") as audio:
+                    response = await self.client.post(
+                        self.settings.elevenlabs_stt_url,
+                        data={
+                            "model_id": self.settings.elevenlabs_stt_model,
+                            "language_code": self.settings.elevenlabs_stt_language,
+                            "tag_audio_events": "false",
+                            "diarize": "false",
+                        },
+                        files={"file": (path.name, audio, mime_type or "application/octet-stream")},
+                    )
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise ApiError(f"HTTP {response.status_code}: {response.text[:500]}")
+                response.raise_for_status()
+                result = response.json()
+                if not str(result.get("text", "")).strip():
+                    raise ApiError("Transcription ElevenLabs vide")
+                return result
+            except (httpx.HTTPError, ApiError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt < self.settings.elevenlabs_stt_max_retries:
+                    await asyncio.sleep(min(8, 2 ** (attempt - 1)))
+        raise ApiError(f"Échec transcription ElevenLabs: {last_error}")
 
 
 class AnkiConnectClient:

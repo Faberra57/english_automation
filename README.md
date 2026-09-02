@@ -1,6 +1,9 @@
 # English Teacher Bot
 
-Un professeur d'anglais privé piloté depuis Telegram. Il archive chaque texte et chaque audio, transcrit les voix avec Groq/Whisper, corrige avec DeepSeek, récupère les faiblesses antérieures depuis SQLite et crée des fiches Anki le soir.
+Un professeur d'anglais privé piloté depuis Telegram. Il archive chaque texte et chaque audio, compare les transcriptions de xAI et ElevenLabs, attend votre sélection dans Streamlit, puis corrige avec DeepSeek, récupère les faiblesses antérieures depuis SQLite et crée des fiches Anki.
+
+Pour installer tout le projet sur un serveur avec Docker, y compris Anki Desktop et
+AnkiConnect, suivez [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Organisation du code
 
@@ -11,7 +14,7 @@ english_teacher/
 ├── main.py                    # démarrage et validation de configuration
 ├── config.py                  # lecture/validation de .env
 ├── database.py                # schéma et accès SQLite/RAG
-├── clients.py                 # DeepSeek, Groq et AnkiConnect
+├── clients.py                 # DeepSeek, xAI STT, ElevenLabs et AnkiConnect
 ├── service.py                 # logique pédagogique et fiches
 ├── telegram_app.py            # commandes, messages et planification
 └── utils.py                   # fonctions génériques
@@ -24,12 +27,13 @@ Les dépendances suivent un seul sens : Telegram appelle le service, le service 
 ```text
 Telegram ──texte/audio──> bot Python
                             ├── archive brute + SQLite (RAG)
-                            ├── Groq Whisper (audio → texte)
-                            ├── DeepSeek (correction/sujet/fiches)
-                            └── AnkiConnect → Anki Desktop → serveur Anki Sync → iPhone
+                            ├── xAI + ElevenLabs (2 transcriptions)
+                            ├── choix dans Streamlit
+                            ├── DeepSeek (correction/sujet/fiches après le choix)
+                            └── AnkiConnect → Anki Desktop → AnkiWeb → iPhone
 ```
 
-SQLite est la source de vérité. Le RAG sélectionne les erreurs avec un score combinant pertinence lexicale, répétition, sévérité et récence. Cela garde le déploiement léger et totalement local pour les données; seuls Telegram, Groq et DeepSeek reçoivent les éléments nécessaires à leur étape.
+SQLite est la source de vérité. Le RAG sélectionne les erreurs avec un score combinant pertinence lexicale, répétition, sévérité et récence. Cela garde le déploiement léger et totalement local pour les données; seuls Telegram, xAI, ElevenLabs et DeepSeek reçoivent les éléments nécessaires à leur étape.
 
 ## Point important sur Anki
 
@@ -38,13 +42,13 @@ AnkiConnect et un serveur Anki Sync sont deux composants différents :
 - **AnkiConnect** est une extension REST chargée dans Anki Desktop. Elle crée les notes et propose l'action `sync`.
 - **Anki Sync Server** synchronise une collection existante entre clients; il ne fournit pas l'API AnkiConnect.
 
-Il faut donc une instance Anki Desktop persistante sur le serveur (éventuellement dans un conteneur avec interface web/Xvfb), avec AnkiConnect installé et le profil configuré pour votre serveur Sync. Le bot contacte cette instance sur le port 8765. Écrire directement dans `collection.anki2` est volontairement évité : cela risquerait les conflits et la corruption.
+Il faut donc une instance Anki Desktop persistante sur le serveur (éventuellement dans un conteneur avec interface web/Xvfb), avec AnkiConnect installé et le profil connecté à AnkiWeb. Le bot contacte cette instance sur le port 8765. Écrire directement dans `collection.anki2` est volontairement évité : cela risquerait les conflits et la corruption. Un serveur Anki Sync auto-hébergé reste possible, mais il n'est pas nécessaire pour ce déploiement.
 
-Si AnkiConnect est arrêté au moment de la tâche du soir, les cartes restent dans SQLite avec l'état `pending`/`failed`. La tâche de reprise et la commande `/cards` les renvoient plus tard sans doublons.
+La validation d'une sélection dans Streamlit envoie immédiatement les cartes choisies à AnkiConnect puis appelle la synchronisation AnkiWeb. Si AnkiConnect est arrêté, les cartes restent dans SQLite avec l'état `pending`/`failed`. La tâche de reprise et la commande `/cards` les renvoient plus tard sans doublons.
 
 ## Installation
 
-Prérequis : Docker Engine avec le plugin Compose, un bot créé auprès de `@BotFather`, les clés DeepSeek/Groq et une instance Anki Desktop + AnkiConnect si l'export Anki est activé. Pour le développement local, utilisez `uv` (aucun `pip install` n'est nécessaire).
+Prérequis : Docker Engine avec le plugin Compose, un bot créé auprès de `@BotFather`, les clés DeepSeek/xAI/ElevenLabs et une instance Anki Desktop + AnkiConnect si l'export Anki est activé. Pour le développement local, utilisez `uv` (aucun `pip install` n'est nécessaire).
 
 ```bash
 cp .env.example .env
@@ -58,7 +62,8 @@ chmod 700 data
 - `TELEGRAM_ALLOWED_USER_IDS`
 - `TELEGRAM_CHAT_ID`
 - `DEEPSEEK_API_KEY`
-- `GROQ_API_KEY`
+- `XAI_API_KEY`
+- `ELEVENLABS_API_KEY`
 
 Pour limiter les entrées pendant les tests, utilisez `INPUT_MODE=write_only`,
 `INPUT_MODE=audio_only` ou `INPUT_MODE=both` (valeur par défaut).
@@ -87,12 +92,15 @@ uv run --locked python -m pytest
 Le tableau de bord local est séparé en trois pages :
 
 - **Journal** : productions regroupées par jour, sujet associé, recherche et filtres,
-  textes originaux, lecteur audio, transcriptions, corrections annotées en rouge/vert,
-  reformulations C1–C2, erreurs et cartes Anki ;
+  lecteur audio, comparaison xAI/ElevenLabs et sélection de la transcription à conserver,
+  corrections annotées en rouge/vert, reformulations C1–C2, erreurs et cartes Anki.
+  L’onglet **Détails** contient aussi une zone de suppression définitive avec confirmation ;
+  elle efface la production, son audio et toutes les données qui lui sont directement liées ;
 - **Cartes** : historique intégral des propositions, comparaison recto/verso et
   sélection contrôlée de 5 à 10 cartes ; les cartes non choisies restent visibles ;
-- **Statistiques** : régularité, volumes writing/speaking, mots pratiqués, catégories
-  d'erreurs, cartes Anki, santé des traitements et erreurs récurrentes.
+- **Statistiques** : régularité, volumes writing/speaking, mots pratiqués, part des choix
+  xAI/ElevenLabs et évolution dans le temps, catégories d'erreurs, cartes Anki,
+  santé des traitements et erreurs récurrentes.
 
 Lancement local :
 
@@ -101,8 +109,9 @@ uv sync --locked
 uv run --locked streamlit run streamlit_app.py
 ```
 
-Ouvrez ensuite <http://localhost:8501>. Le tableau de bord ouvre SQLite en lecture
-seule et actualise les données toutes les 15 secondes (un bouton d'actualisation est
+Ouvrez ensuite <http://localhost:8501>. Le tableau de bord lit SQLite et n'y écrit que
+pour enregistrer vos sélections de transcriptions et de cartes. Il actualise les données
+toutes les 15 secondes (un bouton d'actualisation est
 aussi disponible).
 
 Avec Docker, le service `dashboard` démarre avec le bot :
@@ -131,7 +140,7 @@ Pour désactiver temporairement l'intégration : `ANKI_ENABLED=false`. Les fiche
 ## Commandes Telegram
 
 - Envoyer un texte : archivage et correction immédiate.
-- Envoyer une note vocale, un audio ou un document audio : archivage du fichier original, transcription archivée, puis correction.
+- Envoyer une note vocale, un audio ou un document audio : archivage, transcription parallèle par xAI et ElevenLabs, puis attente du choix dans la page Journal. DeepSeek et la génération des cartes ne démarrent qu'après cette sélection.
 - `/writing` : lance immédiatement un exercice écrit, sans attendre l'horaire planifié.
 - `/speaking` : lance immédiatement un exercice oral, sans attendre l'horaire planifié.
 - `/journaling` : ouvre une entrée libre sur votre journée, sans sujet généré ; le
@@ -139,8 +148,9 @@ Pour désactiver temporairement l'intégration : `ANKI_ENABLED=false`. Les fiche
 - `/topic` : force la génération du sujet du jour.
 - `/cards` : au premier appel, génère 20 propositions (5 cartes de vocabulaire
   thématique, 5 structures utiles, 5 cartes de grammaire et 5 cartes liées aux
-  erreurs de vocabulaire ou autres). Après la sélection Streamlit, un nouvel appel
-  envoie uniquement les cartes choisies vers Anki.
+  erreurs de vocabulaire ou autres). La validation dans Streamlit envoie ensuite
+  automatiquement les cartes choisies vers Anki et synchronise AnkiWeb. Un nouvel
+  appel à `/cards` sert seulement de reprise manuelle si cet envoi a échoué.
 - `/stats` : compteurs de la mémoire locale.
 - `/retry 42` : retente la transcription/correction de la production 42.
 - `/help` : affiche le résumé des commandes directement dans Telegram.
@@ -161,7 +171,7 @@ data/
 └── audio/YYYY/MM/DD/...
 ```
 
-La base contient les textes originaux, légendes, transcriptions détaillées, corrections JSON, erreurs, sujets, fiches et états Anki. Les fichiers audio ont un SHA-256 et leur chemin relatif est enregistré. `AUDIO_RETENTION_DAYS=0` signifie conservation illimitée; aucune purge automatique n'est actuellement exécutée, même si une autre valeur est définie.
+La base contient les textes originaux, les deux transcriptions détaillées, le fournisseur choisi et la date du choix, les corrections JSON, erreurs, sujets, fiches et états Anki. Les fichiers audio ont un SHA-256 et leur chemin relatif est enregistré. `AUDIO_RETENTION_DAYS=0` signifie conservation illimitée; aucune purge automatique n'est actuellement exécutée, même si une autre valeur est définie.
 
 Pour une sauvegarde simple et cohérente, arrêtez brièvement le service, sauvegardez tout `data/`, puis redémarrez-le :
 
@@ -189,6 +199,6 @@ Pour un transport réellement auto-hébergé, **Matrix + Synapse + Element** est
 
 ## Limites connues
 
-- Whisper fournit une transcription, pas une mesure acoustique fiable de la prononciation. Le bot ne prétend donc pas noter accent, rythme ou intonation.
+- xAI et ElevenLabs fournissent des transcriptions, pas une mesure acoustique fiable de la prononciation. Le bot ne prétend donc pas noter accent, rythme ou intonation.
 - Avec l'API Bot Telegram hébergée, le téléchargement d'un fichier par un bot est limité; la valeur par défaut du projet reste sous cette limite.
 - La mémoire RAG actuelle est locale et légère, mais lexicale. Pour de la recherche sémantique multilingue à grande échelle, on pourra ajouter ultérieurement un modèle d'embeddings local et Chroma/Qdrant sans changer le schéma métier SQLite.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -105,6 +106,9 @@ class DashboardRepository:
             submissions = [dict(row) for row in connection.execute(query, params).fetchall()]
             submission_ids = [int(item["id"]) for item in submissions]
             errors_by_submission: dict[int, list[dict[str, Any]]] = {item_id: [] for item_id in submission_ids}
+            candidates_by_submission: dict[int, list[dict[str, Any]]] = {
+                item_id: [] for item_id in submission_ids
+            }
             if submission_ids:
                 placeholders = ",".join("?" for _ in submission_ids)
                 detail_rows = connection.execute(
@@ -123,12 +127,29 @@ class DashboardRepository:
                     detail = dict(row)
                     detail["card_tags"] = parse_json(detail.pop("card_tags_json", None), [])
                     errors_by_submission[int(detail["submission_id"])].append(detail)
+                candidate_rows = connection.execute(
+                    f"""
+                    SELECT c.*, CASE WHEN ch.candidate_id=c.id THEN 1 ELSE 0 END AS selected,
+                           ch.chosen_at
+                    FROM transcription_candidates c
+                    LEFT JOIN transcription_choices ch ON ch.submission_id=c.submission_id
+                    WHERE c.submission_id IN ({placeholders})
+                    ORDER BY c.submission_id,
+                             CASE c.provider WHEN 'xai' THEN 1 ELSE 2 END
+                    """,
+                    submission_ids,
+                ).fetchall()
+                for row in candidate_rows:
+                    candidate = dict(row)
+                    candidate["response"] = parse_json(candidate.pop("response_json", None), {})
+                    candidates_by_submission[int(candidate["submission_id"])].append(candidate)
 
         for submission in submissions:
             submission["topic"] = parse_json(submission.pop("topic_json", None), {})
             submission["correction"] = parse_json(submission.get("correction_json"), {})
             submission["transcription"] = parse_json(submission.get("transcription_json"), {})
             submission["errors"] = errors_by_submission[int(submission["id"])]
+            submission["transcription_candidates"] = candidates_by_submission[int(submission["id"])]
         return {"submissions": submissions, "truncated": len(submissions) >= params[-1]}
 
     def statistics(self) -> dict[str, Any]:
@@ -202,6 +223,24 @@ class DashboardRepository:
                     "SELECT status, COUNT(*) AS count FROM submissions GROUP BY status ORDER BY count DESC"
                 ).fetchall()
             ]
+            transcription_provider_choices = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT provider, COUNT(*) AS count,
+                              ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS percentage
+                       FROM transcription_choices GROUP BY provider ORDER BY count DESC"""
+                ).fetchall()
+            ]
+            transcription_choices_daily = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT substr(chosen_at,1,10) AS day,
+                              SUM(CASE WHEN provider='xai' THEN 1 ELSE 0 END) AS xai,
+                              SUM(CASE WHEN provider='elevenlabs' THEN 1 ELSE 0 END) AS elevenlabs
+                       FROM transcription_choices
+                       GROUP BY substr(chosen_at,1,10) ORDER BY day"""
+                ).fetchall()
+            ]
             recurring = [
                 dict(row)
                 for row in connection.execute(
@@ -236,8 +275,127 @@ class DashboardRepository:
             "categories": categories,
             "card_statuses": card_statuses,
             "submission_statuses": submission_statuses,
+            "transcription_provider_choices": transcription_provider_choices,
+            "transcription_choices_daily": transcription_choices_daily,
             "recurring": recurring,
         }
+
+    def choose_transcription(self, submission_id: int, candidate_id: int) -> dict[str, Any]:
+        with self._connect_writable() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            submission = connection.execute(
+                "SELECT * FROM submissions WHERE id=?", (submission_id,)
+            ).fetchone()
+            if not submission:
+                raise ValueError("Production introuvable.")
+            existing = connection.execute(
+                "SELECT provider FROM transcription_choices WHERE submission_id=?", (submission_id,)
+            ).fetchone()
+            if existing:
+                raise ValueError(f"Une transcription {existing['provider']} a déjà été choisie.")
+            candidate = connection.execute(
+                """SELECT * FROM transcription_candidates
+                   WHERE id=? AND submission_id=? AND status='succeeded'""",
+                (candidate_id, submission_id),
+            ).fetchone()
+            if not candidate or not str(candidate["transcript"] or "").strip():
+                raise ValueError("Cette transcription n'est pas disponible.")
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            connection.execute(
+                """INSERT INTO transcription_choices(submission_id,candidate_id,provider,chosen_at)
+                   VALUES(?,?,?,?)""",
+                (submission_id, candidate_id, candidate["provider"], now),
+            )
+            connection.execute(
+                """UPDATE submissions SET transcript=?,transcription_json=?,status='transcribed',
+                   failure_reason=NULL WHERE id=?""",
+                (candidate["transcript"], candidate["response_json"], submission_id),
+            )
+            connection.commit()
+            return {
+                "submission_id": submission_id,
+                "provider": candidate["provider"],
+                "transcript": candidate["transcript"],
+                "local_date": submission["local_date"],
+                "activity_type": submission["activity_type"] or "speaking",
+            }
+
+    def delete_submission(
+        self,
+        submission_id: int,
+        *,
+        data_dir: Path,
+        audio_dir: Path,
+    ) -> dict[str, Any]:
+        """Delete one production and its directly related data, including its audio file."""
+        staged_audio: Path | None = None
+        original_audio: Path | None = None
+        with self._connect_writable() as connection:
+            submission = connection.execute(
+                "SELECT id,audio_path,topic_id,local_date FROM submissions WHERE id=?", (submission_id,)
+            ).fetchone()
+            if not submission:
+                raise ValueError("Production introuvable ou déjà supprimée.")
+
+            stored_audio = str(submission["audio_path"] or "").strip()
+            if stored_audio:
+                raw_path = Path(stored_audio).expanduser()
+                original_audio = (
+                    raw_path.resolve(strict=False)
+                    if raw_path.is_absolute()
+                    else (data_dir / raw_path).resolve(strict=False)
+                )
+                allowed_root = audio_dir.expanduser().resolve(strict=False)
+                if not original_audio.is_relative_to(allowed_root):
+                    raise ValueError(
+                        "Suppression refusée : le fichier audio enregistré se trouve hors du dossier audio autorisé."
+                    )
+                if original_audio.exists():
+                    if not original_audio.is_file():
+                        raise ValueError("Suppression refusée : le chemin audio n'est pas un fichier.")
+                    staged_audio = original_audio.with_name(
+                        f".{original_audio.name}.deleting-{uuid.uuid4().hex}"
+                    )
+                    original_audio.replace(staged_audio)
+
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute("DELETE FROM submissions WHERE id=?", (submission_id,))
+                if cursor.rowcount != 1:
+                    raise ValueError("La production n'a pas pu être supprimée.")
+                if submission["topic_id"] is not None:
+                    connection.execute(
+                        """DELETE FROM activity_topics WHERE id=? AND NOT EXISTS
+                           (SELECT 1 FROM submissions WHERE topic_id=?)""",
+                        (submission["topic_id"], submission["topic_id"]),
+                    )
+                connection.execute(
+                    """DELETE FROM card_proposals WHERE local_date=? AND source_submission_id IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM submissions WHERE local_date=?)""",
+                    (submission["local_date"], submission["local_date"]),
+                )
+                connection.execute(
+                    """DELETE FROM topics WHERE local_date=?
+                       AND NOT EXISTS (SELECT 1 FROM submissions WHERE local_date=?)""",
+                    (submission["local_date"], submission["local_date"]),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                if staged_audio and staged_audio.exists() and original_audio:
+                    staged_audio.replace(original_audio)
+                raise
+
+        audio_deleted = False
+        if staged_audio and staged_audio.exists():
+            try:
+                staged_audio.unlink()
+                audio_deleted = True
+            except OSError as exc:
+                raise OSError(
+                    f"La base a été nettoyée, mais le fichier temporaire reste à supprimer : {staged_audio}"
+                ) from exc
+        return {"submission_id": submission_id, "audio_deleted": audio_deleted}
 
     def proposal_dates(self) -> list[str]:
         with self._connect() as connection:

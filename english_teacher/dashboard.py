@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import difflib
 import re
@@ -12,7 +13,9 @@ import pandas as pd
 import streamlit as st
 
 from .config import Settings
+from .database import Database
 from .dashboard_data import DashboardRepository
+from .service import EnglishTeacherService
 
 
 KIND_LABELS = {
@@ -23,6 +26,7 @@ KIND_LABELS = {
 }
 STATUS_LABELS = {
     "received": "Reçu",
+    "awaiting_transcript_choice": "Choix de transcription requis",
     "transcribed": "Transcrit",
     "processed": "Corrigé",
     "failed": "Échec",
@@ -368,6 +372,14 @@ def _render_submission(settings: Settings, submission: dict[str, Any]) -> None:
                 st.write(transcript)
             if not raw_text and not transcript:
                 st.caption("Aucun texte archivé pour cette production.")
+            candidates = submission.get("transcription_candidates") or []
+            if candidates:
+                st.markdown("### Comparaison des transcriptions")
+                st.caption(
+                    "Écoutez l’audio, comparez les deux versions, puis gardez celle qui reproduit "
+                    "le plus fidèlement vos mots et vos erreurs."
+                )
+                _render_transcription_candidates(settings, submission, candidates)
         with correction_tab:
             _render_correction(submission)
         with learning_tab:
@@ -379,6 +391,118 @@ def _render_submission(settings: Settings, submission: dict[str, Any]) -> None:
                 st.write(f"Traitée le : {_format_datetime(submission['processed_at'])}")
             if submission.get("failure_reason"):
                 st.error(submission["failure_reason"])
+            st.divider()
+            st.markdown("#### Zone dangereuse")
+            st.caption(
+                "Cette action supprime définitivement la production, son fichier audio, ses deux "
+                "transcriptions, son choix, sa correction, ses erreurs et ses cartes directement liées."
+            )
+            confirmed = st.checkbox(
+                f"Je confirme la suppression définitive de la production #{submission['id']}",
+                key=f"confirm-delete-submission-{submission['id']}",
+            )
+            if st.button(
+                "Supprimer définitivement cette production",
+                key=f"delete-submission-{submission['id']}",
+                disabled=not confirmed,
+                use_container_width=True,
+            ):
+                repository = DashboardRepository(settings.database_path)
+                try:
+                    repository.delete_submission(
+                        int(submission["id"]),
+                        data_dir=settings.data_dir,
+                        audio_dir=settings.audio_dir,
+                    )
+                    st.cache_data.clear()
+                    st.toast(f"Production #{submission['id']} supprimée définitivement.", icon="🗑️")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Suppression impossible : {exc}")
+
+
+def _render_transcription_candidates(
+    settings: Settings, submission: dict[str, Any], candidates: list[dict[str, Any]]
+) -> None:
+    provider_labels = {"xai": "xAI (Grok)", "elevenlabs": "ElevenLabs Scribe"}
+    columns = st.columns(max(1, len(candidates)))
+    already_selected = next((item for item in candidates if item.get("selected")), None)
+    for column, candidate in zip(columns, candidates):
+        provider = str(candidate["provider"])
+        label = provider_labels.get(provider, provider)
+        with column:
+            with st.container(border=True):
+                st.markdown(f"**{label}**")
+                latency = candidate.get("latency_ms")
+                if latency is not None:
+                    st.caption(f"Temps de transcription : {float(latency) / 1000:.1f} s")
+                if candidate["status"] == "failed":
+                    st.error("La transcription a échoué pour ce fournisseur.")
+                    if candidate.get("error"):
+                        st.caption(str(candidate["error"])[:300])
+                    continue
+                st.write(str(candidate.get("transcript") or ""))
+                if candidate.get("selected"):
+                    st.success("Transcription conservée")
+                elif not already_selected and submission["status"] == "awaiting_transcript_choice":
+                    if st.button(
+                        f"Garder {label}",
+                        key=f"choose-transcript-{submission['id']}-{candidate['id']}",
+                        use_container_width=True,
+                        type="primary",
+                    ):
+                        repository = DashboardRepository(settings.database_path)
+                        try:
+                            with st.spinner("Correction DeepSeek et génération des cartes en cours…"):
+                                selection = repository.choose_transcription(
+                                    int(submission["id"]), int(candidate["id"])
+                                )
+                                card_count, card_error = asyncio.run(
+                                    _process_transcript_choice(settings, selection)
+                                )
+                            st.cache_data.clear()
+                            if card_error:
+                                st.warning(
+                                    "La correction est terminée, mais la génération des cartes a échoué : "
+                                    + card_error
+                                )
+                            else:
+                                st.success(
+                                    f"{label} conservé. Correction terminée et {card_count} carte(s) proposée(s)."
+                                )
+                            st.rerun()
+                        except Exception as exc:
+                            st.cache_data.clear()
+                            st.error(f"Le choix est enregistré, mais le traitement a échoué : {exc}")
+
+
+async def _process_transcript_choice(
+    settings: Settings, selection: dict[str, Any]
+) -> tuple[int, str | None]:
+    database = Database(settings)
+    service = EnglishTeacherService(settings, database)
+    try:
+        try:
+            await service.correct(
+                int(selection["submission_id"]),
+                str(selection["transcript"]),
+                str(selection.get("activity_type") or "transcribed audio"),
+            )
+        except Exception as exc:
+            await database.update_submission(
+                int(selection["submission_id"]), status="failed", failure_reason=str(exc)[:1000]
+            )
+            raise
+        try:
+            created = await service.generate_cards(
+                str(selection["local_date"]),
+                source_submission_id=int(selection["submission_id"]),
+            )
+            return created, None
+        except Exception as exc:
+            return 0, str(exc)[:500]
+    finally:
+        await service.close()
 
 
 def _render_correction(submission: dict[str, Any]) -> None:
@@ -485,6 +609,30 @@ def render_statistics(settings: Settings) -> None:
     second_row[3].metric("Erreurs / production", error_average)
     second_row[4].metric("Cartes Anki", int(summary.get("cards") or 0))
 
+    st.markdown("### Comparatif des transcriptions")
+    provider_choices = pd.DataFrame(data["transcription_provider_choices"])
+    if provider_choices.empty:
+        st.info("Aucun choix de transcription enregistré pour le moment.")
+    else:
+        labels = {"xai": "xAI (Grok)", "elevenlabs": "ElevenLabs Scribe"}
+        provider_choices["provider"] = provider_choices["provider"].map(
+            lambda value: labels.get(value, value)
+        )
+        winner = provider_choices.iloc[0]
+        comparison_cols = st.columns(3)
+        comparison_cols[0].metric("Choix enregistrés", int(provider_choices["count"].sum()))
+        comparison_cols[1].metric("API la plus choisie", str(winner["provider"]))
+        comparison_cols[2].metric("Part du meilleur choix", f"{float(winner['percentage']):.1f} %")
+        st.bar_chart(provider_choices.set_index("provider")["count"], color="#0c7c73")
+        choice_daily = pd.DataFrame(data["transcription_choices_daily"])
+        if not choice_daily.empty:
+            choice_daily["day"] = pd.to_datetime(choice_daily["day"])
+            choice_daily = choice_daily.set_index("day").rename(
+                columns={"xai": "xAI (Grok)", "elevenlabs": "ElevenLabs Scribe"}
+            )
+            with st.expander("Voir l’évolution des choix dans le temps"):
+                st.line_chart(choice_daily, color=["#0c7c73", "#9d6ab3"])
+
     st.markdown("### Activité dans le temps")
     daily = pd.DataFrame(data["daily"])
     if not daily.empty:
@@ -552,8 +700,12 @@ def render_cards(settings: Settings) -> None:
     _sidebar_header(settings)
     _hero(
         "Sélection des cartes",
-        "Compare les 20 propositions, choisis-en 5 à 10 pour Anki et conserve toutes les autres dans ton historique.",
+        "Compare les 20 propositions, choisis-en 5 à 10 puis envoie-les directement vers Anki.",
     )
+    notice = st.session_state.pop("card_push_notice", None)
+    if notice:
+        level, message = notice
+        getattr(st, level)(message)
     try:
         dates = _proposal_dates(str(settings.database_path))
     except (FileNotFoundError, OSError) as exc:
@@ -578,8 +730,8 @@ def render_cards(settings: Settings) -> None:
     metrics[3].metric("À vérifier", failed_count)
     if settings.anki_enabled:
         st.info(
-            "Après avoir enregistré ta sélection, utilise de nouveau /cards dans Telegram. "
-            "Seules les cartes sélectionnées seront envoyées à Anki."
+            "La validation envoie immédiatement les cartes sélectionnées à Anki, puis lance la "
+            "synchronisation AnkiWeb. /cards n’est utile que pour générer un lot ou relancer un échec."
         )
     else:
         st.warning(
@@ -621,16 +773,54 @@ def render_cards(settings: Settings) -> None:
                         if card.get("tags"):
                             st.caption("Tags : " + ", ".join(map(str, card["tags"])))
         st.markdown(f"**Sélection actuelle : {len(selected_ids)} / 5–10 cartes**")
-        submitted = st.form_submit_button("Enregistrer la sélection", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Valider et envoyer vers Anki", type="primary", use_container_width=True)
     if submitted:
         try:
             count = DashboardRepository(settings.database_path).save_card_selection(selected_date, selected_ids)
         except ValueError as exc:
             st.error(str(exc))
         else:
-            st.success(f"Sélection enregistrée : {count} carte(s). Les autres propositions restent visibles.")
+            result = asyncio.run(_push_selected_cards(settings, selected_date))
+            pushed = int(result["pushed"])
+            remaining = int(result["remaining"])
+            if not result["anki_enabled"]:
+                notice = (
+                    "warning",
+                    f"Sélection enregistrée : {count} carte(s). Anki est désactivé : "
+                    "elles restent en attente et pourront être renvoyées plus tard.",
+                )
+            elif result["sync_error"]:
+                notice = (
+                    "warning",
+                    f"{pushed} carte(s) envoyée(s) à Anki, {remaining} restante(s). "
+                    f"Synchronisation AnkiWeb non terminée : {result['sync_error']}",
+                )
+            elif result["sync_attempted"] and result["sync_succeeded"]:
+                notice = (
+                    "success",
+                    f"{pushed} carte(s) envoyée(s) à Anki et synchronisation AnkiWeb terminée. "
+                    "Les propositions non choisies restent visibles.",
+                )
+            elif pushed:
+                notice = ("success", f"{pushed} carte(s) envoyée(s) à Anki.")
+            else:
+                notice = (
+                    "info",
+                    "Sélection enregistrée. Aucune nouvelle carte à envoyer : les cartes choisies "
+                    "avaient déjà été ajoutées à Anki.",
+                )
+            st.session_state["card_push_notice"] = notice
             st.cache_data.clear()
             st.rerun()
+
+
+async def _push_selected_cards(settings: Settings, local_date: str) -> dict[str, Any]:
+    database = Database(settings)
+    service = EnglishTeacherService(settings, database)
+    try:
+        return await service.push_pending_cards_detailed(local_date=local_date)
+    finally:
+        await service.close()
 
 
 def _audio_path(settings: Settings, stored_path: str | None) -> Path | None:
